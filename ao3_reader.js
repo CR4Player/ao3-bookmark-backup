@@ -59,6 +59,20 @@ document.addEventListener('DOMContentLoaded', () => {
   bindSelect('#reader-size', fontSize, v => { fontSize = v; }, sizeKey);
   bindSelect('#reader-width', pageWidth, v => { pageWidth = v; }, widthKey);
 
+  // Auto-apply overview sort selection and search clear without requiring a separate button.
+  for (const sel of document.querySelectorAll('select[data-auto-submit]')) {
+    sel.addEventListener('change', () => {
+      if (sel.form) sel.form.submit();
+    });
+  }
+  const searchInput = document.querySelector('.search input[type="search"]');
+  if (searchInput && searchInput.form) {
+    const initialQuery = searchInput.value;
+    searchInput.addEventListener('search', () => {
+      if (searchInput.value !== initialQuery) searchInput.form.submit();
+    });
+  }
+
   // Download dropdown menus: keep only one open and close on outside click / Escape / pick.
   const menus = Array.from(document.querySelectorAll('.download-menu'));
   if (menus.length) {

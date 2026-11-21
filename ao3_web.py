@@ -1016,9 +1016,9 @@ def overview_html(
   <div class="controls-top"><nav class="tabs" aria-label="作品筛选">{''.join(tabs)}</nav>{extra_pills}</div>
   <form class="search" method="get" action="/">{hidden}
     <label class="sr-only" for="search">搜索作品</label>
-    <input type="search" id="search" name="q" placeholder="搜索 ID、标题、作者、标签或备注…" maxlength="200" value="{escape(q)}">
-    <label class="sr-only" for="sort">排序方式</label><select id="sort" name="sort">{options}</select>
-    <button class="button" type="submit">应用</button>
+    <input type="search" id="search" name="q" placeholder="搜索 ID、标题、作者、标签或备注（回车搜索）…" maxlength="200" value="{escape(q)}">
+    <label class="sr-only" for="sort">排序方式</label><select id="sort" name="sort" data-auto-submit>{options}</select>
+    <button class="button js-hide" type="submit">应用</button>
   </form>
 </div>"""
     chip_parts = []

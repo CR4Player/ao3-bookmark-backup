@@ -829,6 +829,8 @@ class SQLiteArchiveTests(unittest.TestCase):
             self.assertIn("账号安全", home_body)
             self.assertIn('href="/schedule"', home_body)
             self.assertIn('href="/logs"', home_body)
+            self.assertIn('id="sort" name="sort" data-auto-submit', home_body)
+            self.assertIn('class="button js-hide" type="submit">应用</button>', home_body)
             self.assertNotIn('id="backup-settings"', home_body)
             self.assertNotIn('id="backup-logs"', home_body)
             home_proof = home_body.split('name="proof" value="', 1)[1].split('"', 1)[0]

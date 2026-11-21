@@ -546,6 +546,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   outline-offset: 2px;
 }
 [hidden] { display: none !important; }
+html.js .js-hide { display: none !important; }
 
 .wrap {
   max-width: 1160px;
