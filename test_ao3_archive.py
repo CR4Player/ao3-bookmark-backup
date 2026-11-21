@@ -16,7 +16,7 @@ from ao3_store import (
 )
 from ao3_web import (
     PER_PAGE, article_html, backup_status, download_filename, home_url, overview_html, render_diff,
-    submitted_settings, work_html,
+    schedule_html, submitted_settings, work_html,
 )
 from test_ao3_backup import FixtureClient, bookmark
 
@@ -638,7 +638,7 @@ class SQLiteArchiveTests(unittest.TestCase):
 
         self.archive.set_backup_settings(weekly)
         reader, _ = self.archive.reader("1234", visit=True)
-        html = overview_html(self.archive, reader, "all", "", "event")
+        html = schedule_html(self.archive, reader)
         self.assertIn('name="schedule_mode" value="manual"', html)
         self.assertIn('id="backup-interval-unit"', html)
         self.assertIn('id="backup-schedule-preview"', html)
@@ -772,9 +772,11 @@ class SQLiteArchiveTests(unittest.TestCase):
         srv = server_box["srv"]
         base = f"http://127.0.0.1:{srv.server_port}"
 
-        def fetch(opener, path, data=None):
+        def fetch(opener, path, data=None, *, headers=None):
             encoded = urllib.parse.urlencode(data, doseq=True).encode("utf-8") if data is not None else None
-            req = urllib.request.Request(base + path, data=encoded, method="POST" if data is not None else "GET")
+            req = urllib.request.Request(
+                base + path, data=encoded, method="POST" if data is not None else "GET", headers=headers or {},
+            )
             try:
                 with opener.open(req, timeout=5) as resp:
                     return resp.status, resp.headers, resp.read().decode("utf-8")
@@ -825,12 +827,18 @@ class SQLiteArchiveTests(unittest.TestCase):
             status, _, home_body = fetch(opener, "/")
             self.assertEqual(status, 200)
             self.assertIn("账号安全", home_body)
+            self.assertIn('href="/schedule"', home_body)
+            self.assertIn('href="/logs"', home_body)
+            self.assertNotIn('id="backup-settings"', home_body)
+            self.assertNotIn('id="backup-logs"', home_body)
             home_proof = home_body.split('name="proof" value="', 1)[1].split('"', 1)[0]
 
-            # Save bookmark user in overview backup settings after setup.
-            status, headers, _ = fetch(opener, "/backup", {
+            # Save bookmark user in dedicated /schedule settings page and verify /logs page.
+            status, _, sched_body = fetch(opener, "/schedule")
+            self.assertEqual(status, 200)
+            self.assertIn('id="backup-settings-form"', sched_body)
+            status, headers, _ = fetch(opener, "/schedule", {
                 "proof": home_proof,
-                "action": "settings",
                 "bookmark_user": "alice_bm",
                 "formats_present": "1",
                 "formats": ["epub"],
@@ -843,11 +851,20 @@ class SQLiteArchiveTests(unittest.TestCase):
                 "retries": "3",
                 "max_errors": "3",
             })
-            self.assertEqual(status, 303)
-            self.assertIn("backup=saved", headers["Location"])
-            status, _, home_body = fetch(opener, "/")
+            self.assertEqual((status, headers["Location"]), (303, "/schedule?saved=1"))
+            status, _, sched_saved_body = fetch(opener, "/schedule?saved=1")
             self.assertEqual(status, 200)
-            self.assertIn("alice_bm", home_body)
+            self.assertIn("alice_bm", sched_saved_body)
+            self.assertIn("抓取设置已保存。", sched_saved_body)
+
+            status, _, logs_body = fetch(opener, "/logs")
+            self.assertEqual(status, 200)
+            self.assertIn('id="backup-log"', logs_body)
+            status, headers, _ = fetch(opener, "/backup?from=logs", {
+                "proof": home_proof,
+                "action": "scan",
+            })
+            self.assertEqual((status, headers["Location"]), (303, "/logs?backup=queued"))
 
             # Unauthenticated browser cannot access home or API status.
             anon = urllib.request.build_opener(NoRedirect())
@@ -871,18 +888,26 @@ class SQLiteArchiveTests(unittest.TestCase):
             })
             self.assertEqual((status, headers["Location"]), (303, "/"))
 
-            status, _, acct_body = fetch(opener2, "/account")
+            status, acct_headers, acct_body = fetch(opener2, "/account")
             self.assertEqual(status, 200)
+            self.assertIn("connect-src 'self'", acct_headers.get("Content-Security-Policy", ""))
+            self.assertIn("auth-slider", acct_body)
+            self.assertIn('id="site-logout-form"', acct_body)
+            self.assertIn("退出 AO3 账号", acct_body)
+            self.assertIn('id="confirm-popover"', acct_body)
+            self.assertNotIn('name="verify_login"', acct_body)
+            self.assertIn('id="site-logout-form"', sched_body)
+            self.assertIn('id="site-logout-form"', logs_body)
+            self.assertIn('id="site-logout-form"', home_body)
             acct_proof = acct_body.split('name="proof" value="', 1)[1].split('"', 1)[0]
 
-            # Invalid AO3 password is rejected immediately before writing to DB.
+            # Invalid AO3 password is always checked online and rejected before writing to DB.
             status, _, bad_cred_body = fetch(opener2, "/account", {
                 "proof": acct_proof,
                 "action": "credentials",
                 "ao3_auth_mode": "encrypted",
                 "ao3_user": "alice_ao3",
                 "ao3_password": "bad-ao3-password",
-                "verify_login": "1",
             })
             self.assertEqual(status, 400)
             self.assertIn("AO3 登录失败", bad_cred_body)
@@ -895,7 +920,6 @@ class SQLiteArchiveTests(unittest.TestCase):
                 "ao3_auth_mode": "encrypted",
                 "ao3_user": "alice_ao3",
                 "ao3_password": "good-ao3-password",
-                "verify_login": "1",
             })
             self.assertEqual((status, headers["Location"]), (303, "/account?saved=credentials_verified"))
             self.assertEqual(self.archive.decrypted_ao3_credentials(), ("encrypted", "alice_ao3", "good-ao3-password"))
@@ -955,6 +979,168 @@ class SQLiteArchiveTests(unittest.TestCase):
             self.assertFalse(fake_client.verify_cookie_session())
         self.archive.mark_ao3_cookie_expired(True)
         self.assertTrue(self.archive.ao3_credentials_status()["cookie_expired"])
+
+    def test_async_ao3_credential_verification_progress_errors_and_cancel(self):
+        import http.cookiejar
+        import time
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        from ao3_web import serve
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        token = self.archive.ensure_setup_token()
+        self.assertTrue(self.archive.verify_setup_token(token))
+        self.archive.setup_web_auth("sitepass123")
+
+        waiting_429 = threading.Event()
+
+        def scripted_login(out_dir, user, password, *, timeout=60, prefer_v4=True, retries=3, stop=None, status_cb=None):
+            if status_cb:
+                status_cb("正在连接 AO3 获取登录安全令牌…")
+            if password == "slow-429-cancel":
+                if status_cb:
+                    status_cb("AO3 触发限流（HTTP 429），等待第 2/3 次重试（剩余 30 秒）")
+                waiting_429.set()
+                assert stop is not None
+                if stop.wait(5):
+                    raise InterruptedError("收到停止信号")
+                return
+            if password == "fail-429":
+                if status_cb:
+                    status_cb("AO3 触发限流（HTTP 429），等待第 2/3 次重试（剩余 15 秒）")
+                time.sleep(0.05)
+                raise ValueError("AO3 请求过于频繁（HTTP 429 限流），自动重试 3 次后仍受限，请稍候几分钟后再试")
+            time.sleep(0.05)
+            (out_dir / "cookies.txt").write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+
+        server_box = {}
+        bound = threading.Event()
+        thread = threading.Thread(
+            target=serve,
+            args=(self.archive, "127.0.0.1", 0),
+            kwargs={"ao3_login_fn": scripted_login, "on_bind": lambda s: (server_box.setdefault("srv", s), bound.set())},
+            daemon=True,
+        )
+        thread.start()
+        self.assertTrue(bound.wait(3))
+        srv = server_box["srv"]
+        base = f"http://127.0.0.1:{srv.server_port}"
+
+        def fetch(opener, path, data=None, *, headers=None):
+            encoded = urllib.parse.urlencode(data, doseq=True).encode("utf-8") if data is not None else None
+            req = urllib.request.Request(
+                base + path, data=encoded, method="POST" if data is not None else "GET", headers=headers or {},
+            )
+            try:
+                with opener.open(req, timeout=5) as resp:
+                    return resp.status, resp.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                try:
+                    return exc.code, exc.read().decode("utf-8")
+                finally:
+                    exc.close()
+
+        try:
+            jar = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), NoRedirect())
+            _, login_html = fetch(opener, "/login")
+            login_proof = login_html.split('name="proof" value="', 1)[1].split('"', 1)[0]
+            status, _ = fetch(opener, "/login", {"proof": login_proof, "next": "/", "password": "sitepass123"})
+            self.assertEqual(status, 303)
+
+            _, acct_body = fetch(opener, "/account")
+            acct_proof = acct_body.split('name="proof" value="', 1)[1].split('"', 1)[0]
+            fetch_hdrs = {"X-Requested-With": "fetch"}
+
+            # 1) Long 429 retry starts asynchronously (202 immediate) and reports live status, then cancels cleanly.
+            t0 = time.monotonic()
+            status, raw = fetch(opener, "/account", {
+                "proof": acct_proof, "action": "credentials", "ao3_auth_mode": "encrypted",
+                "ao3_user": "alice_ao3", "ao3_password": "slow-429-cancel",
+            }, headers=fetch_hdrs)
+            self.assertLess(time.monotonic() - t0, 1.0)
+            self.assertEqual(status, 202)
+            self.assertEqual(json.loads(raw)["state"], "running")
+            self.assertTrue(waiting_429.wait(2))
+
+            status, raw = fetch(opener, "/account/credentials/status")
+            self.assertEqual(status, 200)
+            snap = json.loads(raw)
+            self.assertEqual((snap["state"], snap["tone"]), ("running", "warn"))
+            self.assertIn("429", snap["message"])
+
+            status, raw = fetch(opener, "/account/credentials/cancel", {"proof": acct_proof}, headers=fetch_hdrs)
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(raw)["state"], "cancelled")
+            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("", "", ""))
+
+            # 2) Failed verification exposes exact error message over status endpoint without saving.
+            status, _ = fetch(opener, "/account", {
+                "proof": acct_proof, "action": "credentials", "ao3_auth_mode": "cookie",
+                "ao3_user": "alice_ao3", "ao3_password": "fail-429",
+            }, headers=fetch_hdrs)
+            self.assertEqual(status, 202)
+            for _ in range(40):
+                _, raw = fetch(opener, "/account/credentials/status")
+                snap = json.loads(raw)
+                if snap["state"] != "running":
+                    break
+                time.sleep(0.03)
+            self.assertEqual((snap["state"], snap["tone"]), ("failed", "error"))
+            self.assertIn("HTTP 429 限流", snap["message"])
+            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("", "", ""))
+
+            # 3) Successful async check persists encrypted credentials & status pill, then AO3 logout clears them & cookies.
+            status, _ = fetch(opener, "/account", {
+                "proof": acct_proof, "action": "credentials", "ao3_auth_mode": "encrypted",
+                "ao3_user": "alice_ao3", "ao3_password": "good-password",
+            }, headers=fetch_hdrs)
+            self.assertEqual(status, 202)
+            for _ in range(40):
+                _, raw = fetch(opener, "/account/credentials/status")
+                snap = json.loads(raw)
+                if snap["state"] != "running":
+                    break
+                time.sleep(0.03)
+            self.assertEqual((snap["state"], snap["tone"], snap["configured"], snap["ao3_logged_in"]), ("succeeded", "ok", True, True))
+            self.assertIn("alice_ao3", snap["status_text"])
+            self.assertTrue((self.out / "cookies.txt").exists())
+            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("encrypted", "alice_ao3", "good-password"))
+
+            status, raw = fetch(opener, "/account/ao3-logout", {
+                "proof": acct_proof,
+            }, headers=fetch_hdrs)
+            self.assertEqual(status, 200)
+            logout_snap = json.loads(raw)
+            self.assertEqual((logout_snap["state"], logout_snap["mode"], logout_snap["ao3_logged_in"]), ("succeeded", "public", False))
+            self.assertFalse((self.out / "cookies.txt").exists())
+            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("public", "", ""))
+        finally:
+            srv.shutdown()
+            thread.join(timeout=2)
+
+        # Verify backend error classification in AO3Client / verify_login_and_save_cookies.
+        with patch.object(backup.AO3Client, "_request", side_effect=[
+            b'<form action="/users/login"><input name="authenticity_token" value="tok"></form>',
+            b"<div>The password or user name you entered doesn't match our records</div>",
+        ]):
+            with self.assertRaises(ValueError) as ctx:
+                backup.verify_login_and_save_cookies(self.out, "alice_ao3", "wrong-pw", retries=1)
+            self.assertIn("用户名或密码不正确", str(ctx.exception))
+
+        from urllib.error import HTTPError
+        err_429 = HTTPError("https://archiveofourown.org/users/login", 429, "Too Many Requests", {}, None)
+        try:
+            with patch.object(backup.AO3Client, "_request", side_effect=err_429):
+                with self.assertRaises(ValueError) as ctx:
+                    backup.verify_login_and_save_cookies(self.out, "alice_ao3", "pw", retries=1)
+                self.assertIn("HTTP 429 限流", str(ctx.exception))
+        finally:
+            err_429.close()
 
 
 if __name__ == "__main__":

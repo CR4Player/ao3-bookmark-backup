@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import math
@@ -11,6 +12,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -20,7 +22,7 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import zip_longest
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -140,7 +142,8 @@ def hidden_fields(query: dict[str, str]) -> str:
 
 def page(
     title: str, contents: str, *, detail: bool = False, dashboard: bool = False,
-    reading: bool = False, auth_mode: str = "app",
+    reading: bool = False, auth_mode: str = "app", active_nav: str = "",
+    logout_proof: str = "",
 ) -> str:
     brand = home_url("all") if detail else "/"
     scripts = ['<script src="/reader.js"></script>']
@@ -155,10 +158,40 @@ def page(
 <option value="crimson">经典绯红（AO3）</option></optgroup>
 <optgroup label="深色方案"><option value="night">深邃灰（夜间）</option><option value="dusk">暮夜星辰（深蓝紫）</option>
 <option value="midnight">暗夜森林（深墨绿）</option></optgroup></select></label>"""
-    nav_links = (
-        '<a class="top-link" href="/">总览</a><a class="top-link" href="/account">账号安全</a>'
-        if auth_mode == "app" else ""
+    nav_items = (
+        ("overview", "/", "总览"),
+        ("schedule", "/schedule", "计划"),
+        ("logs", "/logs", "日志"),
+        ("account", "/account", "账号安全"),
     )
+    nav_links = ""
+    confirm_modal = ""
+    if auth_mode == "app":
+        links = "".join(
+            f'<a class="top-link" href="{href}"'
+            f'{" aria-current=\"page\"" if active_nav == key else ""}>{label}</a>'
+            for key, href, label in nav_items
+        )
+        logout_btn = ""
+        if logout_proof:
+            logout_btn = (
+                f'<form id="site-logout-form" class="top-nav-logout" method="post" action="/logout">'
+                f'{hidden_fields({"proof": logout_proof})}'
+                '<button class="top-link is-logout" type="submit" title="退出当前站点"'
+                ' data-confirm-trigger="site"'
+                ' data-confirm-title="确认退出当前站点？"'
+                ' data-confirm-body="退出后将锁定浏览界面，需重新输入站点访问密码才能进入。"'
+                ' data-confirm-ok="确认退出站点">退出</button></form>'
+            )
+            confirm_modal = """<div id="confirm-popover" class="confirm-popover" role="dialog" aria-labelledby="confirm-title" hidden>
+  <p id="confirm-title" class="confirm-title"></p>
+  <p id="confirm-body" class="muted confirm-body"></p>
+  <div class="confirm-actions">
+    <button class="button small" type="button" data-confirm-cancel>取消</button>
+    <button class="button small danger" type="button" data-confirm-accept>确认</button>
+  </div>
+</div>"""
+        nav_links = f'<nav class="top-nav" aria-label="主导航">{links}{logout_btn}</nav>'
     brand_href = escape(brand if auth_mode == "app" else "#")
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -168,7 +201,7 @@ def page(
 <header class="top"><div class="wrap top-row">
 <a class="brand" href="{brand_href}"><span>AO3</span> 书签备份</a>
 <div class="top-actions">{theme_picker}{nav_links}</div></div></header>
-<main class="wrap" id="main">{contents}</main></body></html>"""
+<main class="wrap" id="main">{contents}</main>{confirm_modal}</body></html>"""
 
 
 def work_title(wid: str, record: dict, saved_title: str = "") -> str:
@@ -531,21 +564,22 @@ def backup_status(
     return {"state": state, "previous": previous, "upcoming": upcoming, "tone": tone}
 
 
-def recent_backup_log(archive: Archive) -> str:
+def recent_backup_log(archive: Archive, *, limit: int = 200) -> str:
     path = archive.path.parent / BACKUP_LOG
     try:
         with path.open("rb") as log_file:
             size = log_file.seek(0, os.SEEK_END)
-            start = max(0, size - 32768)
+            read_bytes = 65536
+            start = max(0, size - read_bytes)
             log_file.seek(start)
-            data = log_file.read(32768)
+            data = log_file.read(read_bytes)
     except FileNotFoundError:
         return "等待备份进程输出日志。"
     except OSError:
         return "暂时无法读取备份日志。"
     if start and b"\n" in data:
         data = data.split(b"\n", 1)[1]
-    lines = data.decode("utf-8", errors="replace").splitlines()[-80:]
+    lines = data.decode("utf-8", errors="replace").splitlines()[-limit:]
     log = "\n".join(lines)
     log = re.sub(r"(?i)(\b(?:https?|socks\w*)://)[^/\s@]+@", r"\1***@", log)
     return log or "等待备份进程输出日志。"
@@ -572,19 +606,12 @@ def _initial_bookmark_user(archive: Archive, settings: BackupSettings) -> str:
     )
 
 
-def backup_panel(
-    archive: Archive, reader: dict, context: dict[str, str], settings: BackupSettings,
-    status: dict[str, str], notice: str, *, error: str = "", form_values: dict[str, object] | None = None,
+def _schedule_form_html(
+    archive: Archive, reader: dict, settings: BackupSettings, *,
+    post_action: str = "/schedule", form_values: dict[str, object] | None = None,
     scheduler: dict | None = None,
 ) -> str:
     proof_field = hidden_fields({"proof": backup_proof(reader["id"])})
-    post_url = escape(with_query("/backup", context))
-    list_url = escape(home_url(**context))
-    feedback = ""
-    if error:
-        feedback = f'<p class="warning notice" role="alert">{escape(error)}</p>'
-    elif notice in BACKUP_NOTICES:
-        feedback = f'<p class="notice is-info" role="status">{BACKUP_NOTICES[notice]}</p>'
     vals = form_values or {}
     sched = resolve_schedule(settings)
     mode = _field_first(vals, "schedule_mode", sched["mode"])
@@ -626,7 +653,6 @@ def backup_panel(
     stop_idle_str = _field_first(vals, "stop_after_idle_pages", str(settings.stop_after_idle_pages))
     max_pages_str = _field_first(vals, "max_pages", str(settings.max_pages))
     timeout_str = _field_first(vals, "timeout", str(settings.timeout))
-    settings_open = " open" if (error or not bookmark_user_str) else ""
 
     mode_buttons = "".join(
         f'<label class="schedule-mode-pill"><input type="radio" name="schedule_mode" value="{key}"'
@@ -683,30 +709,7 @@ def backup_panel(
             pass
         preview_text = format_preview_runs(preview_settings)
 
-    return f"""<section class="backup-panel" id="backup" aria-labelledby="backup-heading">
-<div class="backup-heading">
-  <div class="backup-title-wrap">
-    <h2 id="backup-heading">抓取管理</h2>
-    <span class="backup-status-inline" id="backup-status" data-status="{escape(status['tone'])}">
-      <i class="status-dot" aria-hidden="true"></i>
-      <span id="backup-state">{escape(status['state'])}</span>
-    </span>
-  </div>
-  <form class="backup-actions" method="post" action="{post_url}">{proof_field}
-    <button class="button primary" type="submit" name="action" value="scan">立即刷新</button>
-    <button class="button" type="submit" name="action" value="retry">重试失败或缺失项</button>
-    <a class="button" id="backup-refresh-list" href="{list_url}">更新列表</a>
-  </form>
-</div>
-{feedback}
-<div class="backup-meta" role="status">
-  <p class="muted" id="backup-previous">{escape(status['previous'])}</p>
-  <p class="muted" id="backup-upcoming">{escape(status['upcoming'])}</p>
-  <a class="text-link refresh-hint" id="backup-refresh-hint" href="{list_url}" hidden>有新归档完成，点击刷新列表</a>
-</div>
-<div class="backup-details">
-<details id="backup-settings"{settings_open}><summary>抓取设置</summary>
-<form class="backup-form" id="backup-settings-form" method="post" action="{post_url}">{proof_field}
+    return f"""<form class="backup-form" id="backup-settings-form" method="post" action="{escape(post_action)}">{proof_field}
   <input type="hidden" name="formats_present" value="1">
   <input type="hidden" name="advanced_present" value="1">
   <div class="settings-groups">
@@ -805,13 +808,114 @@ def backup_panel(
     <span class="muted">设置保存至数据库，将在调度器空闲时自动生效。</span>
     <button class="button primary" type="submit" name="action" value="settings">保存设置</button>
   </div>
-</form></details>
-<details id="backup-logs"><summary>运行日志</summary>
-<div class="backup-log-card">
-  <div class="backup-log-head"><span>最近 80 行输出</span><span class="muted">自动轮询更新</span></div>
-  <pre id="backup-log" class="backup-log" tabindex="0">{escape(recent_backup_log(archive))}</pre>
+</form>"""
+
+
+def backup_panel(
+    archive: Archive, reader: dict, context: dict[str, str], settings: BackupSettings,
+    status: dict[str, str], notice: str, *, error: str = "", form_values: dict[str, object] | None = None,
+    scheduler: dict | None = None,
+) -> str:
+    proof_field = hidden_fields({"proof": backup_proof(reader["id"])})
+    post_url = escape(with_query("/backup", context))
+    list_url = escape(home_url(**context))
+    feedback = ""
+    if error:
+        feedback = f'<p class="warning notice" role="alert">{escape(error)}</p>'
+    elif notice in BACKUP_NOTICES:
+        feedback = f'<p class="notice is-info" role="status">{BACKUP_NOTICES[notice]}</p>'
+    return f"""<section class="backup-panel" id="backup" aria-labelledby="backup-heading">
+<div class="backup-heading">
+  <div class="backup-title-wrap">
+    <h2 id="backup-heading">抓取管理</h2>
+    <span class="backup-status-inline" id="backup-status" data-status="{escape(status['tone'])}">
+      <i class="status-dot" aria-hidden="true"></i>
+      <span id="backup-state">{escape(status['state'])}</span>
+    </span>
+  </div>
+  <form class="backup-actions" method="post" action="{post_url}">{proof_field}
+    <button class="button primary" type="submit" name="action" value="scan">立即刷新</button>
+    <button class="button" type="submit" name="action" value="retry">重试失败或缺失项</button>
+    <a class="button" id="backup-refresh-list" href="{list_url}">更新列表</a>
+  </form>
 </div>
-</details></div></section>"""
+{feedback}
+<div class="backup-meta" role="status">
+  <p class="muted" id="backup-previous">{escape(status['previous'])}</p>
+  <p class="muted" id="backup-upcoming">{escape(status['upcoming'])}</p>
+  <a class="text-link refresh-hint" id="backup-refresh-hint" href="{list_url}" hidden>有新归档完成，点击刷新列表</a>
+</div></section>"""
+
+
+def schedule_html(
+    archive: Archive, reader: dict, *, notice: str = "", error: str = "",
+    form_values: dict[str, object] | None = None,
+) -> str:
+    scheduler, settings, active_jobs, last = archive.backup_dashboard()
+    status = backup_status(scheduler, active_jobs, last, settings)
+    feedback = ""
+    if error:
+        feedback = f'<p class="warning notice" role="alert">{escape(error)}</p>'
+    elif notice == "saved":
+        feedback = f'<p class="notice is-info" role="status">{BACKUP_NOTICES["saved"]}</p>'
+    form_html = _schedule_form_html(
+        archive, reader, settings, post_action="/schedule", form_values=form_values, scheduler=scheduler,
+    )
+    return page("抓取计划与设置", f"""
+<div class="page-heading">
+  <div class="backup-title-wrap">
+    <h1>抓取计划与设置</h1>
+    <span class="backup-status-inline" id="backup-status" data-status="{escape(status['tone'])}">
+      <i class="status-dot" aria-hidden="true"></i>
+      <span id="backup-state">{escape(status['state'])}</span>
+    </span>
+  </div>
+</div>
+{feedback}
+<section class="backup-panel" aria-label="计划与状态摘要">
+  <div class="backup-meta" role="status">
+    <p class="muted" id="backup-previous">{escape(status['previous'])}</p>
+    <p class="muted" id="backup-upcoming">{escape(status['upcoming'])}</p>
+  </div>
+  {form_html}
+</section>""", dashboard=True, active_nav="schedule", logout_proof=backup_proof(reader["id"]))
+
+
+def logs_html(archive: Archive, reader: dict, *, notice: str = "") -> str:
+    scheduler, settings, active_jobs, last = archive.backup_dashboard()
+    status = backup_status(scheduler, active_jobs, last, settings)
+    proof_field = hidden_fields({"proof": backup_proof(reader["id"])})
+    feedback = ""
+    if notice in BACKUP_NOTICES:
+        feedback = f'<p class="notice is-info" role="status">{BACKUP_NOTICES[notice]}</p>'
+    return page("运行日志", f"""
+<div class="page-heading">
+  <div class="backup-title-wrap">
+    <h1>运行日志</h1>
+    <span class="backup-status-inline" id="backup-status" data-status="{escape(status['tone'])}">
+      <i class="status-dot" aria-hidden="true"></i>
+      <span id="backup-state">{escape(status['state'])}</span>
+    </span>
+  </div>
+  <form class="backup-actions" method="post" action="/backup?from=logs">{proof_field}
+    <button class="button primary" type="submit" name="action" value="scan">立即刷新</button>
+    <button class="button" type="submit" name="action" value="retry">重试失败或缺失项</button>
+  </form>
+</div>
+{feedback}
+<section class="backup-panel" aria-label="日志实时终端">
+  <div class="backup-meta" role="status">
+    <p class="muted" id="backup-previous">{escape(status['previous'])}</p>
+    <p class="muted" id="backup-upcoming">{escape(status['upcoming'])}</p>
+  </div>
+  <div class="backup-log-card is-page">
+    <div class="backup-log-head">
+      <span>最近 200 行输出</span>
+      <span class="muted">自动轮询更新</span>
+    </div>
+    <pre id="backup-log" class="backup-log" tabindex="0">{escape(recent_backup_log(archive, limit=200))}</pre>
+  </div>
+</section>""", dashboard=True, active_nav="logs", logout_proof=backup_proof(reader["id"]))
 
 
 def _pagination_html(context: dict[str, str], page_num: int, total_pages: int) -> str:
@@ -977,7 +1081,7 @@ def overview_html(
     credential_banner = ""
     if not target_bookmark_user:
         credential_banner = (
-            '<p class="notice is-info">站点密码已完成设置。请在下方「抓取设置」中填写目标书签用户名（BOOKMARK_USER）以启动备份；'
+            '<p class="notice is-info">站点密码已完成设置。请前往 <a class="text-link" href="/schedule">计划</a> 填写目标书签用户名（BOOKMARK_USER）以启动备份；'
             '如需同步私有书签或受限作品，可前往 <a class="text-link" href="/account">账号安全</a> 配置并在线校验 AO3 登录凭据。</p>'
         )
     elif creds["auth_mode"] == "cookie" and creds["cookie_expired"]:
@@ -997,7 +1101,7 @@ def overview_html(
 <div class="page-heading"><h1>作品总览</h1><span class="muted">{count_label}</span></div>
 {credential_banner}{panel}{toolbar}{filters}{visit_bar}
 <section class="results" aria-label="{VIEWS[view]}">
-<ul class="work-list" role="list">{rendered}</ul>{pagination}</section>""", dashboard=True)
+<ul class="work-list" role="list">{rendered}</ul>{pagination}</section>""", dashboard=True, active_nav="overview", logout_proof=backup_proof(reader["id"]))
 
 
 def overview_row(row: dict, context: dict[str, str]) -> str:
@@ -1193,9 +1297,10 @@ def render_diff(diff: Difference) -> str:
 
 
 def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) -> tuple[int, str]:
+    l_proof = backup_proof(reader["id"])
     detail = archive.detail(wid, reader)
     if detail is None:
-        return 404, page("找不到作品", '<p class="empty">找不到这篇作品。</p>')
+        return 404, page("找不到作品", '<p class="empty">找不到这篇作品。</p>', logout_proof=l_proof)
     record, versions, events, seen = detail
     title = work_title(wid, record)
     back = overview_query(
@@ -1279,7 +1384,7 @@ def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) 
 {status}</div><div class="work-header-links">{"".join(header_actions)}</div>{tags_box}{about}{error_html}"""
 
     if not order:
-        return 200, page(title, heading + '<p class="empty">还没有成功保存的版本。</p>', detail=True)
+        return 200, page(title, heading + '<p class="empty">还没有成功保存的版本。</p>', detail=True, logout_proof=l_proof)
 
     seen_vid = next((e["version_id"] for e in events if e["kind"] != "file"
                      and e["id"] <= seen and e["version_id"] in versions), None)
@@ -1371,13 +1476,14 @@ def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) 
                    if historical else "")
     timeline_html = (f'<section class="history"><h2>版本历史 <span>{len(order)}</span></h2>'
                      f'<ol class="timeline">{"".join(timeline)}</ol>{old_history}</section>')
-    return 200, page(title, heading + comparison + timeline_html, detail=True)
+    return 200, page(title, heading + comparison + timeline_html, detail=True, logout_proof=l_proof)
 
 
 def article_html(
     wid: str, version: Version, article: Export, *,
     back: dict[str, str] | None = None, fallback: bool = False,
     version_ctx: tuple[int, int, int | None] | None = None,
+    logout_proof: str = "",
 ) -> str:
     values = article.values(version.metadata)
     title = " / ".join(values.pop("标题", ())) or work_title(wid, version.metadata)
@@ -1470,7 +1576,7 @@ def article_html(
 {''.join(chapters)}{note("作品尾注", article.sections.get("作品尾注", []), "h2")}
 </article>
 <div class="reader-fab" aria-label="阅读快捷导航">{toc_fab}<button type="button" class="button small" id="reader-top-btn">↑ 顶部</button></div>"""
-    return page(title, contents, detail=True, reading=True)
+    return page(title, contents, detail=True, reading=True, logout_proof=logout_proof)
 
 
 def _safe_next(raw: str) -> str:
@@ -1482,42 +1588,62 @@ def _safe_next(raw: str) -> str:
     return val
 
 
+_AUTH_SLIDER_OPTIONS = (
+    ("public", "仅公开"),
+    ("encrypted", "加密保存"),
+    ("cookie", "仅 Cookie"),
+)
+
+
+def _ao3_status_badge(creds_status: dict, env_creds: bool) -> tuple[str, str]:
+    if creds_status["auth_mode"] == "encrypted":
+        return "is-ok", f"加密托管中 · {creds_status['user']}"
+    if creds_status["auth_mode"] == "cookie":
+        if creds_status["cookie_expired"]:
+            return "is-warn", f"Cookie 已过期 · 请重登 ({creds_status['user']})"
+        return "is-ok", f"仅 Cookie 有效 · {creds_status['user']}"
+    if env_creds:
+        return "is-info", "回退环境变量账号"
+    return "", "仅公开（未登录）"
+
+
+def _is_ao3_logged_in(archive: Archive, creds_status: dict, env_creds: bool) -> bool:
+    return (
+        creds_status["auth_mode"] in ("encrypted", "cookie")
+        or (not creds_status["configured"] and env_creds)
+        or (archive.root / "cookies.txt").exists()
+    )
+
+
 def _ao3_cred_fields(
     *, auth_mode: str, ao3_user: str, has_saved_password: bool = False,
-    require_password_if_empty: bool = False, verify_login: bool = True,
 ) -> str:
-    mode_buttons = "".join(
-        f'<label class="schedule-mode-pill"><input type="radio" name="ao3_auth_mode" value="{k}"'
+    mode_order = [k for k, _ in _AUTH_SLIDER_OPTIONS]
+    active_index = mode_order.index(auth_mode) if auth_mode in mode_order else 0
+    slider_opts = "".join(
+        f'<label class="auth-slider-opt"><input type="radio" name="ao3_auth_mode" value="{k}"'
         f'{" checked" if auth_mode == k else ""}><span>{label}</span></label>'
-        for k, label in (
-            ("public", "仅公开书签（不登录）"),
-            ("encrypted", "加密保存密码（支持自动重登）"),
-            ("cookie", "仅登录保存 Cookie（不存密码）"),
-        )
+        for k, label in _AUTH_SLIDER_OPTIONS
     )
     pw_placeholder = (
-        "已加密保存（留空保持原密码）" if (auth_mode == "encrypted" and has_saved_password and not require_password_if_empty)
+        "已加密保存（留空沿用原密码）" if (auth_mode == "encrypted" and has_saved_password)
         else "输入 AO3 登录密码"
     )
     return f"""<div class="ao3-auth-box" data-ao3-auth-scope>
   <span class="field-label">AO3 登录方式</span>
-  <div class="schedule-modes" role="radiogroup" aria-label="AO3 登录方式">{mode_buttons}</div>
+  <div class="auth-slider" role="radiogroup" aria-label="AO3 登录方式" data-active-index="{active_index}">
+    <span class="auth-slider-thumb" aria-hidden="true"></span>{slider_opts}
+  </div>
   <p class="muted auth-mode-desc" data-ao3-mode-hint></p>
   <div class="settings-fields" data-ao3-cred-fields{' hidden' if auth_mode == 'public' else ''}>
-    <label><span class="field-label">AO3 登录用户名</span>
+    <label><span class="field-label">AO3 用户名</span>
       <input name="ao3_user" value="{escape(ao3_user)}" autocomplete="username" placeholder="AO3 账号用户名">
     </label>
-    <label><span class="field-label">AO3 登录密码</span>
+    <label><span class="field-label">AO3 密码</span>
       <input type="password" name="ao3_password" value="" autocomplete="current-password"
              placeholder="{escape(pw_placeholder)}" data-has-saved="{1 if has_saved_password else 0}">
       <small data-ao3-pw-hint></small>
     </label>
-    <div class="auth-verify-row" data-ao3-verify-wrap{' hidden' if auth_mode != 'encrypted' else ''}>
-      <label class="inline-check">
-        <input type="checkbox" name="verify_login" value="1"{' checked' if verify_login else ''}>
-        <span>保存前立即向 AO3 在线校验凭据有效性（通过后同步缓存 Cookie）</span>
-      </label>
-    </div>
   </div>
 </div>"""
 
@@ -1576,9 +1702,17 @@ def setup_html(proof_token: str, *, has_existing_data: bool = False, error: str 
 </section>""", auth_mode="public")
 
 
+def _live_tone_class(tone: str) -> str:
+    return {
+        "warn": "is-warn",
+        "error": "is-error",
+        "ok": "is-ok",
+    }.get(tone, "is-info")
+
+
 def account_html(
     archive: Archive, reader: dict, *, creds_status: dict, notice: str = "", error: str = "",
-    auth_mode: str = "", ao3_user: str = "", verify_login: bool = True,
+    auth_mode: str = "", ao3_user: str = "", cred_job: dict | None = None,
 ) -> str:
     proof_val = backup_proof(reader["id"])
     proof_field = hidden_fields({"proof": proof_val})
@@ -1587,45 +1721,44 @@ def account_html(
     effective_mode = auth_mode if auth_mode in AO3_AUTH_MODES else default_mode
     effective_user = ao3_user or creds_status["user"] or os.environ.get("AO3_USER", "").strip()
 
-    if creds_status["auth_mode"] == "encrypted":
-        status_pill = f'<span class="cred-badge is-ok">加密托管中 · {escape(creds_status["user"])}</span>'
-    elif creds_status["auth_mode"] == "cookie":
-        if creds_status["cookie_expired"]:
-            status_pill = f'<span class="cred-badge is-warn">Cookie 已过期 · 请重新登录 ({escape(creds_status["user"])})</span>'
-        else:
-            status_pill = f'<span class="cred-badge is-ok">仅 Cookie 模式有效 · {escape(creds_status["user"])}</span>'
-    elif env_creds:
-        status_pill = '<span class="cred-badge is-info">当前回退使用环境变量账号</span>'
-    else:
-        status_pill = '<span class="cred-badge">仅公开书签模式（未登录）</span>'
+    badge_cls, badge_text = _ao3_status_badge(creds_status, env_creds)
+    status_pill = f'<span id="ao3-cred-badge" class="cred-badge {badge_cls}".rstrip()>{escape(badge_text)}</span>'
+    status_pill = status_pill.replace(' class="cred-badge "', ' class="cred-badge"')
 
     msg_html = ""
     if error:
-        msg_html = f'<p class="warning notice" role="alert">{escape(error)}</p>'
+        msg_html = f'<p id="account-flash-msg" class="warning notice" role="alert">{escape(error)}</p>'
     elif notice == "credentials_verified":
-        msg_html = '<p class="notice is-info" role="status">AO3 登录凭据已通过在线校验并保存（Cookie 已同步更新）。</p>'
+        msg_html = '<p id="account-flash-msg" class="notice is-info" role="status">AO3 登录凭据已通过在线校验并保存（Cookie 已同步更新）。</p>'
     elif notice == "credentials":
-        msg_html = '<p class="notice is-info" role="status">AO3 登录凭据设置已更新。</p>'
+        msg_html = '<p id="account-flash-msg" class="notice is-info" role="status">AO3 登录凭据设置已更新。</p>'
+    elif notice == "ao3_logout":
+        msg_html = '<p id="account-flash-msg" class="notice is-info" role="status">已退出 AO3 账号，本地凭据与 Cookie 已清除（已切回仅公开模式）。</p>'
     elif notice == "password":
-        msg_html = '<p class="notice is-info" role="status">站点访问密码已更新，其余设备会话已自动失效。</p>'
+        msg_html = '<p id="account-flash-msg" class="notice is-info" role="status">站点访问密码已更新，其余设备会话已自动失效。</p>'
 
     env_tip = (
-        '<p class="notice is-info">提示：环境变量中仍检测到 AO3_USER / AO3_PASSWORD。保存此处设置后，可从 .env 删除明文账号。</p>'
+        '<p id="ao3-env-tip" class="notice is-info">提示：环境变量中仍检测到 AO3_USER / AO3_PASSWORD。保存此处设置后，可从 .env 删除明文账号。</p>'
         if env_creds and not creds_status["configured"] else ""
     )
+    job = cred_job or {}
+    job_state = str(job.get("state") or "idle")
+    job_msg = str(job.get("message") or "")
+    job_tone = str(job.get("tone") or "info")
+    show_live = (not error and not notice and job_state == "running" and bool(job_msg))
+    live_cls = f"cred-live-box notice {_live_tone_class(job_tone)}" + (" is-running" if job_state == "running" else "")
+    live_attr = ' role="status" aria-live="polite"' if show_live else ' role="status" aria-live="polite" hidden'
+    is_running = job_state == "running"
+    ao3_logged_in = _is_ao3_logged_in(archive, creds_status, env_creds)
     cred_fields = _ao3_cred_fields(
         auth_mode=effective_mode,
         ao3_user=effective_user,
         has_saved_password=creds_status["has_password"],
-        verify_login=verify_login,
     )
 
     return page("账号与安全", f"""
 <div class="page-heading">
   <h1>账号与安全</h1>
-  <form method="post" action="/logout">{proof_field}
-    <button class="button" type="submit">退出当前登录</button>
-  </form>
 </div>
 {msg_html}{env_tip}
 <div class="account-grid">
@@ -1634,14 +1767,29 @@ def account_html(
       <h2>AO3 抓取凭据</h2>
       {status_pill}
     </div>
-    <p class="muted">加密保存使用独立密钥文件（/data/.credentials.key）保护并支持无人值守自动重登；「仅保存 Cookie」不落盘任何 AO3 密码，安全性最高，但 Cookie 失效时需回到此处重登。</p>
-    <form class="auth-form" method="post" action="/account">{proof_field}
+    <p class="muted">仅公开模式无需登录；使用账号凭据时，保存前必须完成 AO3 在线校验（若触发 429 限流或超时会在下方实时显示重试进度）。</p>
+    <form class="auth-form" method="post" action="/account" data-ao3-cred-form
+          data-cred-job-state="{escape(job_state)}">{proof_field}
       <input type="hidden" name="action" value="credentials">
       {cred_fields}
-      <div class="auth-actions">
-        <button class="button primary" type="submit">保存凭据设置</button>
+      <div id="ao3-cred-live" class="{live_cls}"{live_attr}>
+        <span class="cred-live-dot" aria-hidden="true"></span>
+        <span data-cred-live-text>{escape(job_msg)}</span>
+      </div>
+      <div class="auth-actions is-split">
+        <button class="button danger-outline" type="submit" form="ao3-logout-form"
+                data-ao3-logout-btn{' hidden' if (not ao3_logged_in or is_running) else ''}
+                data-confirm-trigger="ao3"
+                data-confirm-title="确认退出 AO3 账号？"
+                data-confirm-body="将清除已保存的 AO3 凭据与本地 Cookie 并切回仅公开模式；已备份的作品数据不会删除。"
+                data-confirm-ok="确认退出 AO3">退出 AO3 账号</button>
+        <div class="auth-actions-end">
+          <button class="button" type="button" data-cred-cancel{' hidden' if not is_running else ''}>取消校验</button>
+          <button class="button primary" type="submit" data-cred-submit{' disabled' if is_running else ''}>{'校验中…' if is_running else ('保存设置' if effective_mode == 'public' else '保存并校验')}</button>
+        </div>
       </div>
     </form>
+    <form id="ao3-logout-form" method="post" action="/account/ao3-logout" hidden>{proof_field}</form>
   </section>
   <section class="account-card">
     <div class="account-card-head">
@@ -1664,7 +1812,7 @@ def account_html(
       </div>
     </form>
   </section>
-</div>""")
+</div>""", active_nav="account", logout_proof=proof_val)
 
 
 def serve(
@@ -1681,12 +1829,191 @@ def serve(
     secure = "; Secure" if os.environ.get("WEB_COOKIE_SECURE") == "1" else ""
     csrf_secret = secrets.token_bytes(32)
 
-    def _default_login(out_dir: Path, user: str, password: str, *, timeout: int = 60, prefer_v4: bool = True) -> None:
+    def _default_login(
+        out_dir: Path, user: str, password: str, *,
+        timeout: int = 60, prefer_v4: bool = True, retries: int = 3,
+        stop: threading.Event | None = None,
+        status_cb: Callable[[str], None] | None = None,
+    ) -> None:
         from ao3_backup import verify_login_and_save_cookies
 
-        verify_login_and_save_cookies(out_dir, user, password, timeout=timeout, prefer_v4=prefer_v4)
+        verify_login_and_save_cookies(
+            out_dir, user, password,
+            timeout=timeout, prefer_v4=prefer_v4, retries=retries,
+            stop=stop, status_cb=status_cb,
+        )
 
     login_checker = ao3_login_fn or _default_login
+    _checker_params = set(inspect.signature(login_checker).parameters)
+
+    def _invoke_login_checker(
+        user: str, password: str, *, timeout: int, prefer_v4: bool,
+        stop: threading.Event | None = None,
+        status_cb: Callable[[str], None] | None = None,
+    ) -> None:
+        kwargs: dict[str, Any] = {"timeout": timeout, "prefer_v4": prefer_v4}
+        if "retries" in _checker_params:
+            kwargs["retries"] = 3
+        if "stop" in _checker_params:
+            kwargs["stop"] = stop
+        if "status_cb" in _checker_params:
+            kwargs["status_cb"] = status_cb
+        login_checker(archive.root, user, password, **kwargs)
+
+    cred_lock = threading.Lock()
+    cred_state: dict[str, Any] = {
+        "id": "",
+        "state": "idle",
+        "mode": "",
+        "user": "",
+        "message": "",
+        "tone": "info",
+        "started_at": 0.0,
+        "finished_at": 0.0,
+        "stop": None,
+    }
+
+    def _cred_job_snapshot() -> dict[str, Any]:
+        with cred_lock:
+            return {k: v for k, v in cred_state.items() if k != "stop"}
+
+    def _cred_json_payload() -> dict[str, Any]:
+        snap = _cred_job_snapshot()
+        creds = archive.ao3_credentials_status()
+        env_creds = bool(os.environ.get("AO3_USER", "").strip() and os.environ.get("AO3_PASSWORD", ""))
+        badge_cls, badge_text = _ao3_status_badge(creds, env_creds)
+        return {
+            **snap,
+            "job_id": snap.get("id", ""),
+            "configured": creds["configured"],
+            "auth_mode": creds["auth_mode"],
+            "ao3_user": creds["user"],
+            "has_password": creds["has_password"],
+            "cookie_expired": creds["cookie_expired"],
+            "env_creds": env_creds,
+            "status_class": badge_cls,
+            "status_text": badge_text,
+            "ao3_logged_in": _is_ao3_logged_in(archive, creds, env_creds),
+        }
+
+    def _validate_cred_inputs(fields: dict[str, str], creds_status: dict) -> tuple[str, str, str, str]:
+        a_mode = fields.get("ao3_auth_mode", "").strip()
+        a_user = fields.get("ao3_user", "").strip()
+        a_pw = fields.get("ao3_password", "")
+        if a_mode not in AO3_AUTH_MODES:
+            raise ValueError("请选择有效的 AO3 登录方式")
+        if a_mode == "public":
+            return "public", "", "", ""
+        if a_mode == "cookie":
+            if not a_user or not a_pw:
+                raise ValueError("仅 Cookie 模式需要填写 AO3 用户名和密码以完成一次在线登录")
+            return "cookie", a_user, a_pw, a_pw
+        if not a_user:
+            raise ValueError("请填写 AO3 用户名")
+        user_changed = bool(creds_status["user"] and a_user != creds_status["user"])
+        if user_changed and not a_pw:
+            raise ValueError("修改 AO3 用户名时请同时重新输入密码")
+        pw_to_verify = a_pw
+        if not pw_to_verify:
+            prev_mode, _, prev_pw = archive.decrypted_ao3_credentials()
+            pw_to_verify = prev_pw if prev_mode == "encrypted" else ""
+        if not pw_to_verify:
+            raise ValueError("首次启用加密保存时请填写 AO3 密码")
+        return "encrypted", a_user, pw_to_verify, a_pw
+
+    def _start_cred_job(a_mode: str, a_user: str, pw_to_verify: str, pw_to_store: str, cur_settings: BackupSettings) -> None:
+        job_id = secrets.token_hex(8)
+        stop_ev = threading.Event()
+        with cred_lock:
+            prev_stop = cred_state.get("stop")
+            if isinstance(prev_stop, threading.Event):
+                prev_stop.set()
+            cred_state.update({
+                "id": job_id,
+                "state": "running",
+                "mode": a_mode,
+                "user": a_user,
+                "message": "正在启动 AO3 在线校验…",
+                "tone": "info",
+                "started_at": time.time(),
+                "finished_at": 0.0,
+                "stop": stop_ev,
+            })
+
+        def _on_status(msg: str) -> None:
+            with cred_lock:
+                if cred_state["id"] != job_id or cred_state["state"] != "running":
+                    return
+                cred_state["message"] = msg
+                cred_state["tone"] = (
+                    "warn" if any(k in msg for k in ("429", "限流", "重试", "超时", "异常")) else "info"
+                )
+
+        def _worker() -> None:
+            try:
+                _invoke_login_checker(
+                    a_user, pw_to_verify,
+                    timeout=cur_settings.timeout, prefer_v4=cur_settings.prefer_ipv4,
+                    stop=stop_ev, status_cb=_on_status,
+                )
+            except BaseException as exc:  # noqa: BLE001
+                with cred_lock:
+                    if cred_state["id"] == job_id:
+                        cancelled = stop_ev.is_set() or isinstance(exc, InterruptedError)
+                        cred_state.update({
+                            "state": "cancelled" if cancelled else "failed",
+                            "tone": "info" if cancelled else "error",
+                            "message": (
+                                "已取消 AO3 凭据在线校验，未改动原有设置。" if cancelled
+                                else (str(exc) or "AO3 凭据在线校验失败")
+                            ),
+                            "finished_at": time.time(),
+                        })
+                return
+
+            try:
+                with cred_lock:
+                    if stop_ev.is_set() or cred_state["id"] != job_id:
+                        if cred_state["id"] == job_id:
+                            cred_state.update({
+                                "state": "cancelled",
+                                "tone": "info",
+                                "message": "已取消 AO3 凭据在线校验，未改动原有设置。",
+                                "finished_at": time.time(),
+                            })
+                        return
+                    archive.set_ao3_credentials(a_mode, a_user, pw_to_store, clear_cookie_file=False)
+                    cred_state.update({
+                        "state": "succeeded",
+                        "tone": "ok",
+                        "message": "AO3 登录凭据已通过在线校验并保存（Cookie 已同步更新）。",
+                        "finished_at": time.time(),
+                    })
+            except sqlite3.Error:
+                LOG.exception("保存 AO3 校验结果失败")
+                with cred_lock:
+                    if cred_state["id"] == job_id:
+                        cred_state.update({
+                            "state": "failed",
+                            "tone": "error",
+                            "message": "AO3 验证已通过，但写入数据库失败，请稍后重试。",
+                            "finished_at": time.time(),
+                        })
+
+        threading.Thread(target=_worker, name="ao3-cred-check", daemon=True).start()
+
+    def _cancel_cred_job() -> None:
+        with cred_lock:
+            prev_stop = cred_state.get("stop")
+            if isinstance(prev_stop, threading.Event):
+                prev_stop.set()
+            if cred_state["state"] == "running":
+                cred_state.update({
+                    "state": "cancelled",
+                    "tone": "info",
+                    "message": "已取消 AO3 凭据在线校验，未改动原有设置。",
+                    "finished_at": time.time(),
+                })
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -1799,7 +2126,7 @@ def serve(
             if not has_auth:
                 archive.ensure_setup_token()
                 if path != "/setup":
-                    if path == "/backup/status":
+                    if path in {"/backup/status", "/account/credentials/status"}:
                         self.respond(401, json.dumps({"error": "setup_required"}), "application/json; charset=utf-8")
                     else:
                         self.respond(303, "", headers={"Location": "/setup"})
@@ -1824,7 +2151,7 @@ def serve(
                 return
 
             if not self.is_authenticated():
-                if path == "/backup/status":
+                if path in {"/backup/status", "/account/credentials/status"}:
                     self.respond(401, json.dumps({"error": "unauthorized"}), "application/json; charset=utf-8")
                     return
                 next_dest = _safe_next(self.path)
@@ -1842,11 +2169,39 @@ def serve(
                     status["log"] = recent_backup_log(archive)
                 self.respond(200, json.dumps(status, ensure_ascii=False), "application/json; charset=utf-8")
                 return
+            if path == "/account/credentials/status":
+                self.respond(200, json.dumps(_cred_json_payload(), ensure_ascii=False), "application/json; charset=utf-8")
+                return
+            if path == "/schedule":
+                reader, headers = self.reader_context()
+                self.respond(
+                    200,
+                    schedule_html(archive, reader, notice="saved" if query.get("saved") == "1" else ""),
+                    headers=headers,
+                    policy=DASHBOARD_POLICY,
+                )
+                return
+            if path == "/logs":
+                reader, headers = self.reader_context()
+                self.respond(
+                    200,
+                    logs_html(archive, reader, notice=query.get("backup", "")),
+                    headers=headers,
+                    policy=DASHBOARD_POLICY,
+                )
+                return
             if path == "/account":
                 reader, headers = self.reader_context()
                 creds = archive.ao3_credentials_status()
-                self.respond(200, account_html(archive, reader, creds_status=creds, notice=query.get("saved", "")),
-                             headers=headers)
+                self.respond(
+                    200,
+                    account_html(
+                        archive, reader, creds_status=creds,
+                        notice=query.get("saved", ""), cred_job=_cred_job_snapshot(),
+                    ),
+                    headers=headers,
+                    policy=DASHBOARD_POLICY,
+                )
                 return
             view, sort = query.get("view", ""), query.get("sort", "")
             q = query.get("q", "")[:200].strip()
@@ -1864,7 +2219,10 @@ def serve(
                 reader, headers = ({}, {}) if "prefetch" in purpose.lower() else self.reader_context()
                 if saved := archive.read_latest_article(wid):
                     version, article, fallback = saved
-                    html = article_html(wid, version, article, back=back, fallback=fallback)
+                    html = article_html(
+                        wid, version, article, back=back, fallback=fallback,
+                        logout_proof=backup_proof(reader["id"]) if reader else "",
+                    )
                     if reader:
                         try:
                             archive.mark_article_read(reader, wid, version.id)
@@ -1894,10 +2252,17 @@ def serve(
                             "Content-Disposition": download_filename(wid, int(vid), export_title, ext),
                         })
                     else:
+                        reader, headers = self.reader_context()
                         v_ctx = archive.version_info(wid, int(vid))
-                        self.respond(200, article_html(wid, version, article,
-                                                       back=back if query else None, version_ctx=v_ctx),
-                                     policy=READER_POLICY)
+                        self.respond(
+                            200,
+                            article_html(
+                                wid, version, article, back=back if query else None,
+                                version_ctx=v_ctx, logout_proof=backup_proof(reader["id"]),
+                            ),
+                            headers=headers,
+                            policy=READER_POLICY,
+                        )
                     return
             file_match = re.fullmatch(r"/files/([0-9]+)/([0-9]{1,18})/([a-z0-9]+)", path)
             if file_match:
@@ -1926,7 +2291,14 @@ def serve(
                                      wip=wip, noted=noted, page_num=page_num, notice=query.get("backup", ""))
                 self.respond(200, html, headers=headers, policy=DASHBOARD_POLICY)
 
+        def _is_fetch(self) -> bool:
+            return self.headers.get("X-Requested-With", "").casefold() == "fetch"
+
+        def respond_json(self, status: int, payload: dict[str, Any]) -> None:
+            self.respond(status, json.dumps(payload, ensure_ascii=False), "application/json; charset=utf-8")
+
         def do_POST(self):
+            is_fetch = self._is_fetch()
             if not self.allowed():
                 self.respond(403, "访问地址未获允许", "text/plain; charset=utf-8")
                 return
@@ -1934,15 +2306,25 @@ def serve(
                 target = urlsplit(self.path)
                 match = re.fullmatch(r"/works/([0-9]+)/read", target.path)
                 length = positive_id(self.headers.get("Content-Length", ""))
-                allowed_paths = {"/setup", "/login", "/logout", "/account", "/backup", "/overview/seen"}
+                allowed_paths = {
+                    "/setup", "/login", "/logout", "/account",
+                    "/account/ao3-logout", "/account/credentials/cancel",
+                    "/schedule", "/backup", "/overview/seen",
+                }
                 if not (match or target.path in allowed_paths) or not 0 < length <= 4096:
-                    self.respond(400, "请求无效", "text/plain; charset=utf-8")
+                    if is_fetch:
+                        self.respond_json(400, {"state": "failed", "tone": "error", "message": "请求参数无效"})
+                    else:
+                        self.respond(400, "请求无效", "text/plain; charset=utf-8")
                     return
                 try:
                     fields = parse_qs(self.rfile.read(length).decode("utf-8", "replace"),
                                       keep_blank_values=True, max_num_fields=48)
                 except ValueError:
-                    self.respond(400, "请求无效", "text/plain; charset=utf-8")
+                    if is_fetch:
+                        self.respond_json(400, {"state": "failed", "tone": "error", "message": "请求体解析失败"})
+                    else:
+                        self.respond(400, "请求无效", "text/plain; charset=utf-8")
                     return
                 flat_fields = {key: values[0] for key, values in fields.items()}
 
@@ -1953,19 +2335,28 @@ def serve(
                     self.post_login(flat_fields)
                     return
                 if not archive.has_web_auth():
-                    self.respond(303, "", headers={"Location": "/setup"})
+                    if is_fetch:
+                        self.respond_json(401, {"state": "failed", "tone": "error", "message": "尚未完成初始化设置"})
+                    else:
+                        self.respond(303, "", headers={"Location": "/setup"})
                     return
                 if not self.is_authenticated():
-                    self.respond(303, "", headers={"Location": "/login"})
+                    if is_fetch:
+                        self.respond_json(401, {"state": "failed", "tone": "error", "message": "登录会话已失效，请刷新页面重新登录"})
+                    else:
+                        self.respond(303, "", headers={"Location": "/login"})
                     return
 
                 rid = self.cookie()
                 if not rid:
-                    self.respond(400, page("需要会话 Cookie", (
-                        '<p class="warning notice">未检测到浏览器会话 Cookie。请确认未禁用 Cookie'
-                        '（局域网 HTTP 访问请设置 WEB_COOKIE_SECURE=0），然后返回总览重试。</p>'
-                        '<p><a class="button" href="/">返回总览</a></p>'
-                    )))
+                    if is_fetch:
+                        self.respond_json(400, {"state": "failed", "tone": "error", "message": "未检测到会话 Cookie，请刷新页面重试"})
+                    else:
+                        self.respond(400, page("需要会话 Cookie", (
+                            '<p class="warning notice">未检测到浏览器会话 Cookie。请确认未禁用 Cookie'
+                            '（局域网 HTTP 访问请设置 WEB_COOKIE_SECURE=0），然后返回总览重试。</p>'
+                            '<p><a class="button" href="/">返回总览</a></p>'
+                        )))
                     return
 
                 if target.path == "/logout":
@@ -1977,8 +2368,56 @@ def serve(
                         return
                     self.respond(303, "", headers={**self.clear_session_headers(), "Location": "/login"})
                     return
+                if target.path == "/account/ao3-logout":
+                    token = flat_fields.get("proof", "")
+                    if not re.fullmatch("[0-9a-f]{64}", token) or not hmac.compare_digest(
+                        token.encode("utf-8"), backup_proof(rid).encode("utf-8")
+                    ):
+                        if is_fetch:
+                            self.respond_json(403, {"state": "failed", "tone": "error", "message": "请求来源校验失败，请刷新页面重试"})
+                        else:
+                            self.respond(403, "请从账号安全页提交退出 AO3 操作", "text/plain; charset=utf-8")
+                        return
+                    _cancel_cred_job()
+                    archive.set_ao3_credentials("public", "", "", clear_cookie_file=True)
+                    with cred_lock:
+                        cred_state.update({
+                            "id": secrets.token_hex(8),
+                            "state": "succeeded",
+                            "mode": "public",
+                            "user": "",
+                            "message": "已退出 AO3 账号，本地凭据与 Cookie 已清除（已切回仅公开模式）。",
+                            "tone": "ok",
+                            "started_at": time.time(),
+                            "finished_at": time.time(),
+                            "stop": None,
+                        })
+                    if is_fetch:
+                        self.respond_json(200, _cred_json_payload())
+                    else:
+                        self.respond(303, "", headers={"Location": "/account?saved=ao3_logout"})
+                    return
+                if target.path == "/account/credentials/cancel":
+                    token = flat_fields.get("proof", "")
+                    if not re.fullmatch("[0-9a-f]{64}", token) or not hmac.compare_digest(
+                        token.encode("utf-8"), backup_proof(rid).encode("utf-8")
+                    ):
+                        if is_fetch:
+                            self.respond_json(403, {"state": "failed", "tone": "error", "message": "请求来源校验失败，请刷新页面重试"})
+                        else:
+                            self.respond(403, "请从账号安全页提交取消操作", "text/plain; charset=utf-8")
+                        return
+                    _cancel_cred_job()
+                    if is_fetch:
+                        self.respond_json(200, _cred_json_payload())
+                    else:
+                        self.respond(303, "", headers={"Location": "/account"})
+                    return
                 if target.path == "/account":
                     self.post_account(rid, flat_fields)
+                    return
+                if target.path == "/schedule":
+                    self.post_schedule(rid, fields)
                     return
                 if target.path == "/backup":
                     self.post_backup(rid, target.query, fields)
@@ -2003,10 +2442,16 @@ def serve(
                 return
             except sqlite3.Error:
                 LOG.exception("写入 SQLite 归档失败")
-                self.respond(503, "暂时无法保存提交请求", "text/plain; charset=utf-8")
+                if is_fetch:
+                    self.respond_json(503, {"state": "failed", "tone": "error", "message": "暂时无法写入数据库，请稍后重试"})
+                else:
+                    self.respond(503, "暂时无法保存提交请求", "text/plain; charset=utf-8")
             except Exception:
                 LOG.exception("处理归档提交失败")
-                self.respond(500, "暂时无法处理提交请求", "text/plain; charset=utf-8")
+                if is_fetch:
+                    self.respond_json(500, {"state": "failed", "tone": "error", "message": "服务器内部错误，请稍后重试"})
+                else:
+                    self.respond(500, "暂时无法处理提交请求", "text/plain; charset=utf-8")
 
         def post_setup(self, fields: dict[str, list[str]]) -> None:
             if archive.has_web_auth():
@@ -2071,54 +2516,56 @@ def serve(
             self.respond(303, "", headers=resp_headers)
 
         def post_account(self, rid: str, fields: dict[str, str]) -> None:
+            is_fetch = self._is_fetch()
             token = fields.get("proof", "")
             if not re.fullmatch("[0-9a-f]{64}", token) or not hmac.compare_digest(
                 token.encode("utf-8"), backup_proof(rid).encode("utf-8")
             ):
-                self.respond(403, "请从账号安全页提交修改", "text/plain; charset=utf-8")
+                if is_fetch:
+                    self.respond_json(403, {"state": "failed", "tone": "error", "message": "页面验证令牌已过期，请刷新后重试"})
+                else:
+                    self.respond(403, "请从账号安全页提交修改", "text/plain; charset=utf-8")
                 return
             reader, _ = archive.reader(rid, visit=False)
             creds_status = archive.ao3_credentials_status()
             action = fields.get("action", "")
-            verify_login = fields.get("verify_login", "") == "1"
             try:
                 if action == "credentials":
-                    a_mode = fields.get("ao3_auth_mode", "").strip()
-                    a_user = fields.get("ao3_user", "").strip()
-                    a_pw = fields.get("ao3_password", "")
-                    if a_mode not in AO3_AUTH_MODES:
-                        raise ValueError("请选择有效的 AO3 登录方式")
+                    a_mode, a_user, pw_to_verify, pw_to_store = _validate_cred_inputs(fields, creds_status)
                     _, cur_settings, _, _ = archive.backup_dashboard()
-                    verified = False
-                    if a_mode == "cookie":
-                        if not a_user or not a_pw:
-                            raise ValueError("切换到仅 Cookie 模式需要填写用户名和密码以完成一次在线登录")
-                        login_checker(
-                            archive.root, a_user, a_pw,
-                            timeout=cur_settings.timeout, prefer_v4=cur_settings.prefer_ipv4,
-                        )
-                        verified = True
-                    elif a_mode == "encrypted":
-                        if not a_user:
-                            raise ValueError("请填写 AO3 用户名")
-                        user_changed = bool(creds_status["user"] and a_user != creds_status["user"])
-                        if user_changed and not a_pw:
-                            raise ValueError("修改 AO3 用户名时请同时重新输入密码")
-                        pw_to_test = a_pw
-                        if not pw_to_test:
-                            prev_mode, _, prev_pw = archive.decrypted_ao3_credentials()
-                            pw_to_test = prev_pw if prev_mode == "encrypted" else ""
-                        if not pw_to_test:
-                            raise ValueError("首次启用加密保存时请填写 AO3 密码")
-                        if verify_login:
-                            login_checker(
-                                archive.root, a_user, pw_to_test,
-                                timeout=cur_settings.timeout, prefer_v4=cur_settings.prefer_ipv4,
-                            )
-                            verified = True
-                    archive.set_ao3_credentials(a_mode, a_user, a_pw, clear_cookie_file=(a_mode == "public"))
-                    saved_flag = "credentials_verified" if verified else "credentials"
-                    self.respond(303, "", headers={"Location": f"/account?saved={saved_flag}"})
+                    if is_fetch:
+                        if a_mode == "public":
+                            _cancel_cred_job()
+                            archive.set_ao3_credentials("public", "", "", clear_cookie_file=True)
+                            with cred_lock:
+                                cred_state.update({
+                                    "id": secrets.token_hex(8),
+                                    "state": "succeeded",
+                                    "mode": "public",
+                                    "user": "",
+                                    "message": "已切换为仅公开书签模式（未登录）。",
+                                    "tone": "ok",
+                                    "started_at": time.time(),
+                                    "finished_at": time.time(),
+                                    "stop": None,
+                                })
+                            self.respond_json(200, _cred_json_payload())
+                            return
+                        _start_cred_job(a_mode, a_user, pw_to_verify, pw_to_store, cur_settings)
+                        self.respond_json(202, _cred_json_payload())
+                        return
+
+                    if a_mode == "public":
+                        _cancel_cred_job()
+                        archive.set_ao3_credentials("public", "", "", clear_cookie_file=True)
+                        self.respond(303, "", headers={"Location": "/account?saved=credentials"})
+                        return
+                    _invoke_login_checker(
+                        a_user, pw_to_verify,
+                        timeout=cur_settings.timeout, prefer_v4=cur_settings.prefer_ipv4,
+                    )
+                    archive.set_ao3_credentials(a_mode, a_user, pw_to_store, clear_cookie_file=False)
+                    self.respond(303, "", headers={"Location": "/account?saved=credentials_verified"})
                     return
                 if action == "password":
                     cur_pw = fields.get("current_password", "")
@@ -2131,14 +2578,24 @@ def serve(
                     return
                 raise ValueError("无效的账户操作")
             except (ValueError, RuntimeError) as exc:
-                self.respond(400, account_html(
-                    archive, reader, creds_status=creds_status, error=str(exc),
-                    auth_mode=fields.get("ao3_auth_mode", ""), ao3_user=fields.get("ao3_user", ""),
-                    verify_login=verify_login,
-                ))
+                if is_fetch:
+                    self.respond_json(400, {"state": "failed", "tone": "error", "message": str(exc)})
+                    return
+                self.respond(
+                    400,
+                    account_html(
+                        archive, reader, creds_status=creds_status, error=str(exc),
+                        auth_mode=fields.get("ao3_auth_mode", ""), ao3_user=fields.get("ao3_user", ""),
+                        cred_job=_cred_job_snapshot(),
+                    ),
+                    policy=DASHBOARD_POLICY,
+                )
             except sqlite3.Error:
                 LOG.exception("保存账户设置失败")
-                self.respond(503, "暂时无法保存账户设置", "text/plain; charset=utf-8")
+                if is_fetch:
+                    self.respond_json(503, {"state": "failed", "tone": "error", "message": "暂时无法保存账户设置，请稍后重试"})
+                else:
+                    self.respond(503, "暂时无法保存账户设置", "text/plain; charset=utf-8")
 
         def _overview_back(self, query: str) -> dict[str, str]:
             return {key: values[0] for key, values in parse_qs(query).items()
@@ -2161,14 +2618,41 @@ def serve(
                 back["view"] = "all"
             self.respond(303, "", headers={"Location": with_query("/", {**back, "backup": "seen"})})
 
+        def post_schedule(self, rid: str, fields: dict[str, list[str]]) -> None:
+            token = _field_first(fields, "proof", "")
+            if not re.fullmatch("[0-9a-f]{64}", token) or not hmac.compare_digest(
+                token.encode("utf-8"), backup_proof(rid).encode("utf-8")
+            ):
+                self.respond(403, "请从计划页提交抓取设置", "text/plain; charset=utf-8")
+                return
+            try:
+                base_settings = archive.backup_settings() or archive.backup_dashboard()[1]
+                archive.set_backup_settings(submitted_settings(fields, base=base_settings))
+            except ValueError as exc:
+                reader, _ = archive.reader(rid, visit=False)
+                self.respond(
+                    400,
+                    schedule_html(archive, reader, error=str(exc), form_values=fields),
+                    policy=DASHBOARD_POLICY,
+                )
+                return
+            except sqlite3.Error:
+                LOG.exception("保存抓取计划失败")
+                self.respond(503, "暂时无法保存抓取设置", "text/plain; charset=utf-8")
+                return
+            self.respond(303, "", headers={"Location": "/schedule?saved=1"})
+
         def post_backup(self, rid: str, query: str, fields: dict[str, list[str]]) -> None:
             token = _field_first(fields, "proof", "")
-            if not re.fullmatch("[0-9a-f]{64}", token) or not hmac.compare_digest(token, backup_proof(rid)):
+            if not re.fullmatch("[0-9a-f]{64}", token) or not hmac.compare_digest(
+                token.encode("utf-8"), backup_proof(rid).encode("utf-8")
+            ):
                 self.respond(403, "请从总览页提交抓取操作", "text/plain; charset=utf-8")
                 return
             back = self._overview_back(query)
+            from_logs = parse_qs(query).get("from", [""])[0] == "logs"
+            action = _field_first(fields, "action", "")
             try:
-                action = _field_first(fields, "action", "")
                 if action == "settings":
                     base_settings = archive.backup_settings() or archive.backup_dashboard()[1]
                     archive.set_backup_settings(submitted_settings(fields, base=base_settings))
@@ -2177,6 +2661,13 @@ def serve(
                     notice = "queued" if archive.queue_backup(action) else "pending"
             except ValueError as exc:
                 reader, _ = archive.reader(rid, visit=False)
+                if action == "settings":
+                    self.respond(
+                        400,
+                        schedule_html(archive, reader, error=str(exc), form_values=fields),
+                        policy=DASHBOARD_POLICY,
+                    )
+                    return
                 view = back.get("view", "all") if back.get("view") in VIEWS else "all"
                 sort = back.get("sort", "event") if back.get("sort") in SORTS else "event"
                 html = overview_html(
@@ -2191,6 +2682,9 @@ def serve(
             except sqlite3.Error:
                 LOG.exception("保存抓取操作失败")
                 self.respond(503, "暂时无法保存抓取操作", "text/plain; charset=utf-8")
+                return
+            if from_logs:
+                self.respond(303, "", headers={"Location": with_query("/logs", {"backup": notice})})
                 return
             self.respond(303, "", headers={"Location": with_query("/", {**back, "backup": notice}) + "#backup"})
 

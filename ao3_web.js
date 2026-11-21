@@ -1,4 +1,5 @@
 const logPanel = document.querySelector('#backup-logs');
+const logPre = document.querySelector('#backup-log');
 const statusBox = document.querySelector('#backup-status');
 const refreshHint = document.querySelector('#backup-refresh-hint');
 const previousEl = document.querySelector('#backup-previous');
@@ -7,7 +8,8 @@ const fields = ['state', 'previous', 'upcoming', 'log'];
 
 async function refreshBackupStatus() {
   if (document.hidden) return;
-  const path = logPanel && logPanel.open ? '/backup/status?logs=1' : '/backup/status';
+  const needLogs = Boolean(logPre && (!logPanel || logPanel.open));
+  const path = needLogs ? '/backup/status?logs=1' : '/backup/status';
   try {
     const response = await fetch(path);
     if (!response.ok) return;
@@ -34,11 +36,12 @@ async function refreshBackupStatus() {
 if (logPanel) {
   logPanel.addEventListener('toggle', () => {
     if (logPanel.open) {
-      const log = document.querySelector('#backup-log');
-      if (log) log.scrollTop = log.scrollHeight;
+      if (logPre) logPre.scrollTop = logPre.scrollHeight;
       refreshBackupStatus();
     }
   });
+} else if (logPre) {
+  logPre.scrollTop = logPre.scrollHeight;
 }
 window.addEventListener('pageshow', event => {
   if (event.persisted) window.location.reload();

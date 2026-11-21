@@ -340,28 +340,39 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // AO3 auth mode toggle in /account.
+  // AO3 auth mode slider & async credential verification in /account.
+  let runAo3Logout = null;
   for (const scope of document.querySelectorAll('[data-ao3-auth-scope]')) {
+    const slider = scope.querySelector('.auth-slider');
     const radios = Array.from(scope.querySelectorAll('input[name="ao3_auth_mode"]'));
     const fieldsBox = scope.querySelector('[data-ao3-cred-fields]');
     const userInput = scope.querySelector('input[name="ao3_user"]');
     const pwInput = scope.querySelector('input[name="ao3_password"]');
-    const verifyWrap = scope.querySelector('[data-ao3-verify-wrap]');
     const modeHint = scope.querySelector('[data-ao3-mode-hint]');
     const pwHint = scope.querySelector('[data-ao3-pw-hint]');
 
+    const form = scope.closest('[data-ao3-cred-form]');
+    const liveBox = document.querySelector('#ao3-cred-live');
+    const liveText = document.querySelector('[data-cred-live-text]');
+    const submitBtn = form ? form.querySelector('[data-cred-submit]') : null;
+    const cancelBtn = form ? form.querySelector('[data-cred-cancel]') : null;
+    const ao3LogoutBtn = form ? form.querySelector('[data-ao3-logout-btn]') : null;
+    const statusBadge = document.querySelector('#ao3-cred-badge');
+    const envTip = document.querySelector('#ao3-env-tip');
+    const flashMsg = document.querySelector('#account-flash-msg');
+
     const hints = {
-      public: '不登录 AO3，仅备份目标用户的公开书签和公开作品。',
-      encrypted: '使用独立密钥文件（/data/.credentials.key）加密保存密码，Cookie 失效时可自动重新登录。',
-      cookie: '提交时立即联网登录一次并仅保存 Cookie，密码不写入数据库；Cookie 过期后再回此页重登即可。',
+      public: '不登录 AO3，仅备份目标用户的公开书签与公开作品。',
+      encrypted: '使用密钥文件（/data/.credentials.key）加密存库并支持自动重登；保存前必须联网校验。',
+      cookie: '现场向 AO3 登录换取 Cookie 保存，密码不入库；Cookie 过期后需回此页重登。',
     };
 
     const syncAuth = () => {
-      const checked = radios.find(r => r.checked);
-      const mode = checked ? checked.value : 'public';
+      const idx = Math.max(0, radios.findIndex(r => r.checked));
+      const mode = radios[idx] ? radios[idx].value : 'public';
       const isPublic = mode === 'public';
+      if (slider) slider.dataset.activeIndex = String(idx);
       if (fieldsBox) fieldsBox.hidden = isPublic;
-      if (verifyWrap) verifyWrap.hidden = mode !== 'encrypted';
       if (modeHint) modeHint.textContent = hints[mode] || '';
       if (userInput) userInput.required = !isPublic;
       if (pwInput) {
@@ -369,19 +380,295 @@ document.addEventListener('DOMContentLoaded', () => {
         if (mode === 'cookie') {
           pwInput.placeholder = '输入 AO3 密码用于本次在线登录';
           pwInput.required = true;
-          if (pwHint) pwHint.textContent = '仅用于即时向 AO3 登录换取 Cookie，不保存密码';
+          if (pwHint) pwHint.textContent = '仅用于即时登录换取 Cookie，不写入数据库';
         } else if (mode === 'encrypted') {
-          pwInput.placeholder = hasSaved ? '已加密保存（留空保持原密码）' : '输入 AO3 登录密码';
+          pwInput.placeholder = hasSaved ? '已加密保存（留空沿用原密码）' : '输入 AO3 登录密码';
           pwInput.required = !hasSaved;
-          if (pwHint) pwHint.textContent = hasSaved ? '如需更换密码直接输入新密码，留空则沿用已加密密码' : '将通过 Fernet 对称加密存入配置';
+          if (pwHint) pwHint.textContent = hasSaved ? '更换密码请直接输入；留空则使用已保存密码联网重验' : '通过 Fernet 加密存储并用于自动重登';
         } else {
           pwInput.required = false;
           if (pwHint) pwHint.textContent = '';
         }
       }
+      if (submitBtn && !submitBtn.disabled) {
+        submitBtn.textContent = isPublic ? '保存设置' : '保存并校验';
+      }
     };
 
     scope.addEventListener('change', syncAuth);
     syncAuth();
+
+    if (form && liveBox && liveText && submitBtn) {
+      let pollTimer = 0;
+      let pollErrors = 0;
+      let pollBusy = false;
+
+      const stopPolling = () => {
+        if (pollTimer) {
+          window.clearInterval(pollTimer);
+          pollTimer = 0;
+        }
+      };
+
+      const renderJob = data => {
+        const state = data.state || 'idle';
+        const isRunning = state === 'running';
+        const tone = data.tone || (state === 'failed' ? 'error' : state === 'succeeded' ? 'ok' : 'info');
+        const msg = data.message || '';
+
+        if (msg) {
+          liveBox.hidden = false;
+          liveText.textContent = msg;
+          liveBox.classList.remove('is-info', 'is-warn', 'is-error', 'is-ok', 'is-running');
+          liveBox.classList.add(`is-${tone}`);
+          if (isRunning) liveBox.classList.add('is-running');
+          liveBox.setAttribute('role', tone === 'error' ? 'alert' : 'status');
+        } else {
+          liveBox.hidden = true;
+        }
+
+        if (data.status_text && statusBadge) {
+          statusBadge.textContent = data.status_text;
+          statusBadge.className = data.status_class ? `cred-badge ${data.status_class}` : 'cred-badge';
+        }
+        if (data.configured && envTip) {
+          envTip.hidden = true;
+        }
+
+        if (isRunning) {
+          submitBtn.disabled = true;
+          submitBtn.textContent = '校验中…';
+          if (cancelBtn) {
+            cancelBtn.hidden = false;
+            cancelBtn.disabled = false;
+          }
+          if (ao3LogoutBtn) ao3LogoutBtn.hidden = true;
+        } else {
+          submitBtn.disabled = false;
+          if (cancelBtn) cancelBtn.hidden = true;
+          if (ao3LogoutBtn && 'ao3_logged_in' in data) {
+            ao3LogoutBtn.hidden = !data.ao3_logged_in;
+          }
+          if (state === 'succeeded') {
+            if (pwInput) {
+              pwInput.dataset.hasSaved = (data.auth_mode === 'encrypted' && data.has_password) ? '1' : '0';
+              pwInput.value = '';
+            }
+            if (data.auth_mode === 'public' && data._fromAo3Logout) {
+              const pubRadio = radios.find(r => r.value === 'public');
+              if (pubRadio) pubRadio.checked = true;
+              if (userInput) userInput.value = '';
+            }
+          }
+          syncAuth();
+        }
+      };
+
+      const fetchStatus = async () => {
+        if (pollBusy) return;
+        pollBusy = true;
+        try {
+          const res = await fetch('/account/credentials/status', { headers: { 'X-Requested-With': 'fetch' } });
+          const data = await res.json();
+          pollErrors = 0;
+          if (!res.ok) {
+            stopPolling();
+            renderJob({ state: 'failed', tone: 'error', message: data.message || '登录状态已失效，请刷新页面重新登录' });
+            return;
+          }
+          renderJob(data);
+          if (data.state !== 'running') {
+            stopPolling();
+          }
+        } catch {
+          pollErrors += 1;
+          if (pollErrors >= 6) {
+            stopPolling();
+            renderJob({ state: 'failed', tone: 'error', message: '无法获取后台校验进度，请检查网络连接或刷新页面确认结果。' });
+          }
+        } finally {
+          pollBusy = false;
+        }
+      };
+
+      const startPolling = () => {
+        stopPolling();
+        pollErrors = 0;
+        pollTimer = window.setInterval(fetchStatus, 700);
+        fetchStatus();
+      };
+
+      form.addEventListener('submit', async event => {
+        event.preventDefault();
+        if (flashMsg) flashMsg.hidden = true;
+        stopPolling();
+        submitBtn.disabled = true;
+        submitBtn.textContent = '提交中…';
+        renderJob({ state: 'running', tone: 'info', message: '正在提交校验任务到后台…' });
+
+        try {
+          const body = new URLSearchParams(new FormData(form));
+          const res = await fetch(form.getAttribute('action') || '/account', {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'fetch' },
+            body,
+          });
+          let data = {};
+          try {
+            data = await res.json();
+          } catch {
+            data = { state: 'failed', tone: 'error', message: `服务器响应异常（HTTP ${res.status}）` };
+          }
+          if (!res.ok && data.state !== 'running') {
+            renderJob({ state: 'failed', tone: 'error', message: data.message || `请求失败（HTTP ${res.status}）` });
+            return;
+          }
+          renderJob(data);
+          if (data.state === 'running') {
+            startPolling();
+          }
+        } catch {
+          renderJob({ state: 'failed', tone: 'error', message: '提交校验请求失败：无法连接服务或连接中断，请重试。' });
+        }
+      });
+
+      if (cancelBtn) {
+        cancelBtn.addEventListener('click', async () => {
+          cancelBtn.disabled = true;
+          stopPolling();
+          try {
+            const proofInput = form.querySelector('input[name="proof"]');
+            const body = new URLSearchParams({ proof: proofInput ? proofInput.value : '' });
+            const res = await fetch('/account/credentials/cancel', {
+              method: 'POST',
+              headers: { 'X-Requested-With': 'fetch' },
+              body,
+            });
+            const data = await res.json();
+            renderJob(data);
+          } catch {
+            renderJob({ state: 'failed', tone: 'error', message: '取消请求发送失败，请刷新页面查看状态。' });
+          }
+        });
+      }
+
+      if (form.dataset.credJobState === 'running') {
+        startPolling();
+      }
+
+      runAo3Logout = async targetForm => {
+        if (flashMsg) flashMsg.hidden = true;
+        stopPolling();
+        try {
+          const res = await fetch(targetForm.getAttribute('action') || '/account/ao3-logout', {
+            method: 'POST',
+            headers: { 'X-Requested-With': 'fetch' },
+            body: new URLSearchParams(new FormData(targetForm)),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            renderJob({ state: 'failed', tone: 'error', message: data.message || '退出 AO3 账号失败，请重试。' });
+            return;
+          }
+          renderJob({ ...data, _fromAo3Logout: true });
+        } catch {
+          renderJob({ state: 'failed', tone: 'error', message: '无法连接服务端执行退出操作，请刷新后重试。' });
+        }
+      };
+    }
+  }
+
+  // Global floating secondary confirmation popover (top-right site logout & card AO3 logout).
+  const popover = document.querySelector('#confirm-popover');
+  const popTitle = popover ? popover.querySelector('#confirm-title') : null;
+  const popBody = popover ? popover.querySelector('#confirm-body') : null;
+  const popCancel = popover ? popover.querySelector('[data-confirm-cancel]') : null;
+  const popAccept = popover ? popover.querySelector('[data-confirm-accept]') : null;
+  if (popover && popTitle && popBody && popCancel && popAccept) {
+    let activeTrigger = null;
+
+    const closePopover = () => {
+      popover.hidden = true;
+      if (activeTrigger) activeTrigger.setAttribute('aria-expanded', 'false');
+      activeTrigger = null;
+    };
+
+    const positionPopover = trigger => {
+      const btnRect = trigger.getBoundingClientRect();
+      popover.hidden = false;
+      const popRect = popover.getBoundingClientRect();
+      const margin = 12;
+      let left = btnRect.right > window.innerWidth / 2
+        ? btnRect.right - popRect.width
+        : btnRect.left;
+      left = Math.max(margin, Math.min(left, window.innerWidth - popRect.width - margin));
+      let top = btnRect.bottom + 8;
+      if (top + popRect.height > window.innerHeight - margin && btnRect.top - popRect.height - 8 >= margin) {
+        top = btnRect.top - popRect.height - 8;
+      }
+      popover.style.left = `${Math.round(left)}px`;
+      popover.style.top = `${Math.round(top)}px`;
+    };
+
+    for (const trigger of document.querySelectorAll('[data-confirm-trigger]')) {
+      trigger.setAttribute('aria-haspopup', 'dialog');
+      trigger.setAttribute('aria-expanded', 'false');
+      trigger.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!popover.hidden && activeTrigger === trigger) {
+          closePopover();
+          return;
+        }
+        if (activeTrigger) activeTrigger.setAttribute('aria-expanded', 'false');
+        activeTrigger = trigger;
+        trigger.setAttribute('aria-expanded', 'true');
+        popTitle.textContent = trigger.dataset.confirmTitle || '确认执行操作？';
+        popBody.textContent = trigger.dataset.confirmBody || '';
+        popAccept.textContent = trigger.dataset.confirmOk || '确认';
+        popAccept.disabled = false;
+        positionPopover(trigger);
+        popCancel.focus();
+      });
+    }
+
+    popCancel.addEventListener('click', () => {
+      const prev = activeTrigger;
+      closePopover();
+      if (prev) prev.focus();
+    });
+
+    popAccept.addEventListener('click', async () => {
+      const trigger = activeTrigger;
+      if (!trigger) return;
+      const targetForm = trigger.form || document.getElementById(trigger.getAttribute('form') || '');
+      if (!targetForm) {
+        closePopover();
+        return;
+      }
+      if (targetForm.id === 'ao3-logout-form' && runAo3Logout) {
+        popAccept.disabled = true;
+        closePopover();
+        await runAo3Logout(targetForm);
+        return;
+      }
+      closePopover();
+      HTMLFormElement.prototype.submit.call(targetForm);
+    });
+
+    document.addEventListener('click', event => {
+      if (popover.hidden) return;
+      if (popover.contains(event.target)) return;
+      if (activeTrigger && activeTrigger.contains(event.target)) return;
+      closePopover();
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && !popover.hidden) {
+        const prev = activeTrigger;
+        closePopover();
+        if (prev) prev.focus();
+      }
+    });
+    window.addEventListener('resize', closePopover);
   }
 });

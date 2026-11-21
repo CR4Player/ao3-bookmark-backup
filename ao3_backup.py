@@ -421,16 +421,59 @@ class CookieExpiredError(Exception):
     """仅 Cookie 模式下现有登录态失效，需要通过网页重新登录。"""
 
 
+def _format_net_error(exc: BaseException) -> str:
+    if isinstance(exc, HTTPError):
+        reason = f"（{exc.reason}）" if getattr(exc, "reason", "") else ""
+        return f"HTTP {exc.code}{reason}"
+    if isinstance(exc, TimeoutError):
+        return f"请求超时（{exc}）" if str(exc) else "请求超时"
+    if isinstance(exc, URLError):
+        return f"网络连接异常（{exc.reason}）"
+    return str(exc) or type(exc).__name__
+
+
+def _diagnose_login_failure(page: str, *, missing_csrf: bool = False) -> str:
+    lower = page.casefold()
+    if any(k in lower for k in ("retry later", "too many requests", "rate limit")):
+        return "AO3 触发访问限流（Retry later），请稍候几分钟后再试"
+    if any(k in lower for k in (
+        "captcha", "recaptcha", "hcaptcha", "turnstile", "verify you are human", "just a moment",
+    )):
+        return "AO3 登录触发了人机校验 / 防护拦截，暂时无法自动登录，请先在浏览器核实"
+    if missing_csrf:
+        return "AO3 登录页未返回安全令牌（authenticity_token），可能被防护或代理拦截"
+    if any(k in lower for k in (
+        "doesn't match our records",
+        "please check your user name and password",
+        "invalid email or password",
+        "incorrect password",
+    )):
+        return "AO3 用户名或密码不正确，请核对后重新输入"
+    if any(k in lower for k in ("account has been", "suspended", "locked")):
+        return "AO3 账号状态异常，请先前往 AO3 官网确认账号状态"
+    return "AO3 登录失败：请核对用户名/密码，或确认未被验证码拦截"
+
+
 class AO3Client:
-    def __init__(self, cfg: Config, stop: Optional[threading.Event] = None) -> None:
+    def __init__(
+        self, cfg: Config, stop: Optional[threading.Event] = None,
+        *, status_cb: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self.cfg = cfg
         self.stop = stop
+        self.status_cb = status_cb
         self.jar = MozillaCookieJar(str(cfg.cookie_file))
         self._cookie_mtime = 0.0
         self.reload_cookies(force=True)
         self.opener = build_opener(HTTPCookieProcessor(self.jar))
         self._last = 0.0
         self.logged_in = False
+        self.last_login_error = ""
+
+    def _report(self, message: str) -> None:
+        if self.status_cb is not None and message:
+            with contextlib.suppress(Exception):
+                self.status_cb(message)
 
     def reload_cookies(self, *, force: bool = False) -> None:
         if self.cfg.auth_mode == "public":
@@ -461,8 +504,22 @@ class AO3Client:
             self.logged_in = False
             log.warning("cookie 读取失败，将重新登录: %s", exc)
 
-    def _sleep(self, seconds: float) -> None:
+    def _sleep(self, seconds: float, *, label: str = "") -> None:
         if seconds <= 0:
+            return
+        if self.status_cb is not None and label and seconds > 1.2:
+            deadline = time.monotonic() + seconds
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._report(f"{label}（剩余 {max(1, int(round(remaining)))} 秒）")
+                step = min(1.0, remaining)
+                if self.stop is not None:
+                    if self.stop.wait(step):
+                        raise InterruptedError("收到停止信号")
+                else:
+                    time.sleep(step)
             return
         if self.stop is not None:
             if self.stop.wait(seconds):
@@ -491,6 +548,7 @@ class AO3Client:
 
         for attempt in range(1, self.cfg.retries + 1):
             self._throttle()
+            self._report("正在向 AO3 提交登录凭据…" if body else "正在连接 AO3 获取登录安全令牌…")
             req = Request(url, data=body, method="POST" if body else "GET")
             for k, v in HEADERS.items():
                 req.add_header(k, v)
@@ -513,8 +571,10 @@ class AO3Client:
                             if ra is not None
                             else float(min(300, 60 * 2 ** (attempt - 1)))
                         )
+                        wait_label = f"AO3 触发限流（HTTP 429），等待第 {attempt + 1}/{self.cfg.retries} 次重试"
                     else:
                         back = float(min(60, 3 * 2 ** (attempt - 1)))
+                        wait_label = f"AO3 返回 HTTP {exc.code}，等待第 {attempt + 1}/{self.cfg.retries} 次重试"
                     log.warning(
                         "HTTP %s，%.0fs 后重试（%d/%d）：%s",
                         exc.code,
@@ -523,7 +583,7 @@ class AO3Client:
                         self.cfg.retries,
                         url,
                     )
-                    self._sleep(back)
+                    self._sleep(back, label=wait_label)
                     continue
                 if exc.code == 403:
                     raise RuntimeError(
@@ -541,7 +601,8 @@ class AO3Client:
                         attempt,
                         self.cfg.retries,
                     )
-                    self._sleep(back)
+                    wait_label = f"连接 AO3 异常（{_format_net_error(exc)}），等待第 {attempt + 1}/{self.cfg.retries} 次重试"
+                    self._sleep(back, label=wait_label)
                     continue
                 raise
 
@@ -569,6 +630,7 @@ class AO3Client:
         return False
 
     def login(self, force: bool = False) -> bool:
+        self.last_login_error = ""
         if not self.has_credentials():
             return False
 
@@ -587,6 +649,7 @@ class AO3Client:
         if not token:
             log.error("登录页未找到 authenticity_token，AO3 页面结构可能变了或被拦截")
             self.logged_in = False
+            self.last_login_error = _diagnose_login_failure(page, missing_csrf=True)
             return False
 
         raw = self._request(
@@ -608,7 +671,8 @@ class AO3Client:
             return True
 
         self.logged_in = False
-        log.error("登录失败：账号或密码错误，或触发了人机校验")
+        self.last_login_error = _diagnose_login_failure(text)
+        log.error("登录失败：%s", self.last_login_error)
         return False
 
     def save_cookies(self) -> None:
@@ -627,12 +691,16 @@ class AO3Client:
 
 
 def verify_login_and_save_cookies(
-    out_dir: Path, user: str, password: str, *, timeout: int = 60, prefer_v4: bool = True,
+    out_dir: Path, user: str, password: str, *,
+    timeout: int = 60, prefer_v4: bool = True, retries: int = 3,
+    stop: Optional[threading.Event] = None,
+    status_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
     user = user.strip()
     if not user or not password:
         raise ValueError("请填写完整的 AO3 用户名和密码")
     prefer_ipv4(prefer_v4)
+    attempts = max(1, min(retries, 5))
     tmp_cfg = Config(
         bookmark_user=user,
         out_dir=out_dir,
@@ -640,18 +708,26 @@ def verify_login_and_save_cookies(
         password=password,
         delay=0.5,
         timeout=max(5, timeout),
-        retries=2,
+        retries=attempts,
         prefer_ipv4=prefer_v4,
         formats=(),
         auth_mode="cookie",
     )
-    client = AO3Client(tmp_cfg)
+    client = AO3Client(tmp_cfg, stop=stop, status_cb=status_cb)
     try:
         ok = client.login(force=True)
-    except (HTTPError, RuntimeError, URLError, TimeoutError, OSError) as exc:
-        raise ValueError(f"连接 AO3 验证登录失败：{exc}") from exc
+    except InterruptedError as exc:
+        raise ValueError("已取消 AO3 凭据在线校验") from exc
+    except HTTPError as exc:
+        if exc.code == 429:
+            raise ValueError(f"AO3 请求过于频繁（HTTP 429 限流），自动重试 {attempts} 次后仍受限，请稍候几分钟后再试") from exc
+        raise ValueError(f"连接 AO3 验证登录失败：{_format_net_error(exc)}") from exc
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    except (URLError, TimeoutError, OSError) as exc:
+        raise ValueError(f"连接 AO3 超时或网络失败（已尝试 {attempts} 次）：{_format_net_error(exc)}") from exc
     if not ok:
-        raise ValueError("AO3 登录失败：请核对用户名/密码，或确认未被验证码拦截")
+        raise ValueError(client.last_login_error or "AO3 登录失败：请核对用户名/密码，或确认未被验证码拦截")
 
 
 # --------------------------------------------------------------------------
