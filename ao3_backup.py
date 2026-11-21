@@ -92,6 +92,17 @@ log = logging.getLogger("ao3")
 # --------------------------------------------------------------------------
 # 网络：IPv4 优先 & URL 安全编码
 # --------------------------------------------------------------------------
+_ORIG_GETADDRINFO = socket.getaddrinfo
+_PREFER_IPV4 = False
+
+
+def _v4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002
+    infos = _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+    if _PREFER_IPV4 and family in (0, socket.AF_UNSPEC):
+        infos = sorted(infos, key=lambda i: 0 if i[0] == socket.AF_INET else 1)
+    return infos
+
+
 def prefer_ipv4(enabled: bool = True) -> None:
     """让 getaddrinfo 把 IPv4 地址排在前面。
 
@@ -100,18 +111,15 @@ def prefer_ipv4(enabled: bool = True) -> None:
     单次请求凭空多出 20~40 秒。这里只调整顺序，IPv6 仍作为后备，
     纯 IPv6 环境不受影响。
     """
-    if not enabled:
-        return
-    orig = socket.getaddrinfo
-
-    def _v4_first(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002
-        infos = orig(host, port, family, type, proto, flags)
-        if family in (0, socket.AF_UNSPEC):
-            infos = sorted(infos, key=lambda i: 0 if i[0] == socket.AF_INET else 1)
-        return infos
-
-    socket.getaddrinfo = _v4_first  # type: ignore[assignment]
-    log.debug("已启用 IPv4 优先解析")
+    global _PREFER_IPV4
+    _PREFER_IPV4 = bool(enabled)
+    if _PREFER_IPV4:
+        if socket.getaddrinfo is not _v4_first_getaddrinfo:
+            socket.getaddrinfo = _v4_first_getaddrinfo  # type: ignore[assignment]
+        log.debug("已启用 IPv4 优先解析")
+    else:
+        if socket.getaddrinfo is _v4_first_getaddrinfo:
+            socket.getaddrinfo = _ORIG_GETADDRINFO  # type: ignore[assignment]
 
 
 def normalize_url(url: str) -> str:
@@ -334,6 +342,11 @@ class Config:
     prefer_ipv4: bool = True
     formats: tuple[str, ...] = ("html",)
     refresh_content: bool = False
+    auth_mode: str = ""
+
+    @property
+    def setup_pending_file(self) -> Path:
+        return self.out_dir / ".setup_pending"
 
     @property
     def works_dir(self) -> Path:
@@ -404,20 +417,49 @@ def extract_csrf_token(page: str) -> Optional[str]:
     return None
 
 
+class CookieExpiredError(Exception):
+    """仅 Cookie 模式下现有登录态失效，需要通过网页重新登录。"""
+
+
 class AO3Client:
     def __init__(self, cfg: Config, stop: Optional[threading.Event] = None) -> None:
         self.cfg = cfg
         self.stop = stop
         self.jar = MozillaCookieJar(str(cfg.cookie_file))
-        if cfg.cookie_file.exists():
-            try:
-                self.jar.load(ignore_discard=True, ignore_expires=True)
-                log.debug("已载入 cookie: %s", cfg.cookie_file)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("cookie 读取失败，将重新登录: %s", exc)
+        self._cookie_mtime = 0.0
+        self.reload_cookies(force=True)
         self.opener = build_opener(HTTPCookieProcessor(self.jar))
         self._last = 0.0
         self.logged_in = False
+
+    def reload_cookies(self, *, force: bool = False) -> None:
+        if self.cfg.auth_mode == "public":
+            self.jar.clear()
+            self._cookie_mtime = 0.0
+            self.logged_in = False
+            return
+        if not self.cfg.cookie_file.exists():
+            if self._cookie_mtime:
+                self.jar.clear()
+                self._cookie_mtime = 0.0
+                self.logged_in = False
+            return
+        try:
+            mtime = self.cfg.cookie_file.stat().st_mtime
+        except OSError:
+            return
+        if not force and mtime == self._cookie_mtime:
+            return
+        self.jar.clear()
+        try:
+            self.jar.load(ignore_discard=True, ignore_expires=True)
+            self._cookie_mtime = mtime
+            self.logged_in = False
+            log.debug("已载入 cookie: %s", self.cfg.cookie_file)
+        except Exception as exc:  # noqa: BLE001
+            self._cookie_mtime = 0.0
+            self.logged_in = False
+            log.warning("cookie 读取失败，将重新登录: %s", exc)
 
     def _sleep(self, seconds: float) -> None:
         if seconds <= 0:
@@ -515,6 +557,17 @@ class AO3Client:
     def has_credentials(self) -> bool:
         return bool(self.cfg.user and self.cfg.password)
 
+    def verify_cookie_session(self) -> bool:
+        page = self.get_text("/users/login")
+        if is_logged_in_html(page):
+            self.logged_in = True
+            if not self.cfg.dry_run:
+                self.save_cookies()
+            log.info("已验证有效登录态：%s", self.cfg.user or "Cookie 会话")
+            return True
+        self.logged_in = False
+        return False
+
     def login(self, force: bool = False) -> bool:
         if not self.has_credentials():
             return False
@@ -567,8 +620,38 @@ class AO3Client:
             if os.name != "nt":
                 with contextlib.suppress(OSError):
                     os.chmod(self.cfg.cookie_file, 0o600)
+            with contextlib.suppress(OSError):
+                self._cookie_mtime = self.cfg.cookie_file.stat().st_mtime
         except Exception as exc:  # noqa: BLE001
             log.warning("cookie 保存失败: %s", exc)
+
+
+def verify_login_and_save_cookies(
+    out_dir: Path, user: str, password: str, *, timeout: int = 60, prefer_v4: bool = True,
+) -> None:
+    user = user.strip()
+    if not user or not password:
+        raise ValueError("请填写完整的 AO3 用户名和密码")
+    prefer_ipv4(prefer_v4)
+    tmp_cfg = Config(
+        bookmark_user=user,
+        out_dir=out_dir,
+        user=user,
+        password=password,
+        delay=0.5,
+        timeout=max(5, timeout),
+        retries=2,
+        prefer_ipv4=prefer_v4,
+        formats=(),
+        auth_mode="cookie",
+    )
+    client = AO3Client(tmp_cfg)
+    try:
+        ok = client.login(force=True)
+    except (HTTPError, RuntimeError, URLError, TimeoutError, OSError) as exc:
+        raise ValueError(f"连接 AO3 验证登录失败：{exc}") from exc
+    if not ok:
+        raise ValueError("AO3 登录失败：请核对用户名/密码，或确认未被验证码拦截")
 
 
 # --------------------------------------------------------------------------
@@ -808,9 +891,11 @@ def looks_like_login_redirect(raw: bytes) -> bool:
 def fetch_article(client: AO3Client, work_id: int) -> tuple[Export, int]:
     path = f"/works/{work_id}?view_full_work=true&view_adult=true"
     raw = client.get_bytes(path)
-    if client.has_credentials() and (
+    if (client.has_credentials() or getattr(getattr(client, "cfg", None), "auth_mode", "") == "cookie") and (
         looks_like_login_redirect(raw) or (client.logged_in and b"/users/logout" not in raw)
     ):
+        if not client.has_credentials():
+            raise CookieExpiredError("AO3 登录 Cookie 已失效（仅 Cookie 模式），请在网页「账号与安全」重新登录")
         if not client.login(force=True):
             raise ValueError("AO3 登录已失效，重新登录失败")
         raw = client.get_bytes(path)
@@ -1892,7 +1977,7 @@ def _archive_work(
     if capture:
         try:
             article, size = fetch_article(client, work_id)
-        except InterruptedError:
+        except (InterruptedError, CookieExpiredError):
             raise
         except (ValueError, RuntimeError, URLError, OSError) as exc:
             message = f"抓取全文失败 · {exc}"
@@ -2048,6 +2133,8 @@ def _scan_bookmark_pages(
                         log.error("重登后抓取第 1 页失败: %s", exc)
                         stats["failed"] += 1
                         return False, False
+                elif cfg.auth_mode == "cookie":
+                    raise CookieExpiredError("AO3 登录 Cookie 已过期（仅 Cookie 模式），请在网页「账号与安全」重新登录")
                 else:
                     log.warning("当前是未登录状态，私有书签不会出现；如需备份私有书签请配置账号密码")
 
@@ -2090,6 +2177,8 @@ def _scan_bookmark_pages(
             if archive is not None:
                 try:
                     page_changed += _archive_work(cfg, client, archive, works, b, stop, stats)
+                except CookieExpiredError:
+                    raise
                 except InterruptedError:
                     log.warning("收到停止信号，正在保存已完成进度并退出…")
                     return False, False
@@ -2382,6 +2471,14 @@ def settings_for_config(cfg: Config) -> BackupSettings:
         delay=cfg.delay,
         retries=cfg.retries,
         max_errors=cfg.max_errors,
+        bookmark_user=cfg.bookmark_user,
+        formats=cfg.formats,
+        formats_configured=True,
+        run_on_start=cfg.run_on_start,
+        stop_after_idle_pages=cfg.stop_after_idle_pages,
+        max_pages=cfg.max_pages,
+        timeout=cfg.timeout,
+        prefer_ipv4=cfg.prefer_ipv4,
     )
 
 
@@ -2391,11 +2488,36 @@ def next_run_at(source: Config | BackupSettings, now: Optional[datetime] = None)
     return runs[0] if runs else None
 
 
-def configured_backup(cfg: Config, settings: BackupSettings) -> Config:
+def configured_backup(
+    cfg: Config, settings: BackupSettings, creds: tuple[str, str, str] | None = None,
+) -> Config:
     sched = resolve_schedule(settings)
     interval = timedelta(seconds=sched["seconds"]) if sched["mode"] == "interval" else None
-    return replace(cfg, run_at=sched["run_at"], interval=interval, delay=settings.delay,
-                   retries=settings.retries, max_errors=settings.max_errors)
+    bookmark_user = settings.bookmark_user or cfg.bookmark_user
+    formats = settings.formats if settings.formats_configured else cfg.formats
+    if creds and creds[0]:
+        auth_mode, user, password = creds
+    else:
+        auth_mode = "encrypted" if (cfg.user and cfg.password) else "public"
+        user, password = cfg.user, cfg.password
+    return replace(
+        cfg,
+        bookmark_user=bookmark_user,
+        user=user,
+        password=password,
+        auth_mode=auth_mode,
+        formats=formats,
+        run_at=sched["run_at"],
+        interval=interval,
+        delay=settings.delay,
+        retries=settings.retries,
+        max_errors=settings.max_errors,
+        run_on_start=settings.run_on_start,
+        stop_after_idle_pages=settings.stop_after_idle_pages,
+        max_pages=settings.max_pages,
+        timeout=settings.timeout,
+        prefer_ipv4=settings.prefer_ipv4,
+    )
 
 
 def run_scheduler(
@@ -2403,26 +2525,67 @@ def run_scheduler(
     execute_pass: Callable[[Config, str], tuple[bool, dict[str, int]]],
 ) -> None:
     defaults = settings_for_config(cfg)
-    startup_pending = cfg.run_on_start
+    startup_pending = True
     target: Optional[float] = None
     source = "schedule"
     schedule = None
-    checking_previous_run = True
     heartbeat_at = 0.0
+    checking_previous_run = True
+    waiting_logged = False
+    setup_logged = False
+    last_ipv4: Optional[bool] = None
 
     while not stop.is_set():
         try:
+            if not archive.has_web_auth():
+                token = archive.ensure_setup_token()
+                if not setup_logged and token:
+                    log.info("[SETUP] 首次网页初始化口令（Setup Token）：%s", token)
+                    log.info("[SETUP] 请打开 Web 页面完成设置（口令在初始化完成后自动清除）")
+                    setup_logged = True
+            else:
+                setup_logged = False
+
             settings = archive.backup_settings() or defaults
+            try:
+                creds = archive.decrypted_ao3_credentials()
+            except RuntimeError as exc:
+                creds = ("", "", "")
+                if not waiting_logged:
+                    log.warning("读取 AO3 加密凭据异常：%s", exc)
+            pass_cfg = configured_backup(cfg, settings, creds)
+            if not pass_cfg.bookmark_user:
+                cfg.setup_pending_file.parent.mkdir(parents=True, exist_ok=True)
+                touch_marker(cfg.setup_pending_file)
+                if not waiting_logged:
+                    log.info("等待通过网页完成初始化设置（配置目标书签用户名）…")
+                    waiting_logged = True
+                if time.monotonic() >= heartbeat_at:
+                    archive.publish_scheduler(defaults, pass_cfg.formats, 0, awaiting_setup=True)
+                    heartbeat_at = time.monotonic() + 15
+                stop.wait(BACKUP_POLL_SECONDS)
+                continue
+
+            if waiting_logged or cfg.setup_pending_file.exists():
+                waiting_logged = False
+                heartbeat_at = 0.0
+                with contextlib.suppress(OSError):
+                    cfg.setup_pending_file.unlink()
+
+            if last_ipv4 is None or pass_cfg.prefer_ipv4 != last_ipv4:
+                prefer_ipv4(pass_cfg.prefer_ipv4)
+                last_ipv4 = pass_cfg.prefer_ipv4
+
             sched = resolve_schedule(settings)
             current_schedule = sched["key"]
-            pass_cfg = configured_backup(cfg, settings)
             if startup_pending:
                 startup_pending = False
-                if sched["mode"] != "manual":
+                if pass_cfg.run_on_start and sched["mode"] != "manual":
                     target, source = time.time(), "startup"
                 else:
                     target, source = None, "schedule"
-                    log.info("定时计划：已关闭自动定时（仅手动）")
+                    if sched["mode"] == "manual":
+                        log.info("定时计划：已关闭自动定时（仅手动）")
                     heartbeat_at = 0.0
             if sched["mode"] == "manual":
                 if schedule is not None and current_schedule != schedule:
@@ -2438,7 +2601,7 @@ def run_scheduler(
                 heartbeat_at = 0.0
             schedule = current_schedule
             if time.monotonic() >= heartbeat_at:
-                archive.publish_scheduler(defaults, cfg.formats, int(target or 0))
+                archive.publish_scheduler(defaults, pass_cfg.formats, int(target or 0), awaiting_setup=False)
                 heartbeat_at = time.monotonic() + 15
 
             due = source if target is not None and time.time() >= target else None
@@ -2531,6 +2694,10 @@ def healthcheck(out_dir: Path, max_age_hours: float) -> int:
         except OSError:
             pass
 
+    if (out_dir / ".setup_pending").exists():
+        print("HEALTHY: 等待通过网页完成初始化配置")
+        return 0
+
     marker = out_dir / ".last_run"
     if not marker.exists():
         print(f"UNHEALTHY: {marker} 不存在（还没成功跑过一轮）")
@@ -2546,12 +2713,16 @@ def healthcheck(out_dir: Path, max_age_hours: float) -> int:
     return 0
 
 
-def build_config(args: argparse.Namespace) -> Config:
+def build_config(args: argparse.Namespace, archive: Archive | None = None) -> Config:
     out = Path(args.out or env("OUT_DIR", "./data")).expanduser().resolve()
     bookmark_user = (args.bookmark_user or env("BOOKMARK_USER") or env("AO3_USER")).strip()
-    if not bookmark_user:
+    if not bookmark_user and archive is not None:
+        saved = archive.backup_settings()
+        bookmark_user = (saved.bookmark_user if saved else "") or archive.stored_bookmark_user()
+    require_user = args.once or args.dry_run or args.legacy_files
+    if require_user and not bookmark_user:
         raise SystemExit(
-            "缺少书签所属用户名：请设置 BOOKMARK_USER 环境变量，或用 --bookmark-user 指定。"
+            "缺少书签所属用户名：请通过网页初始化设置，或使用 --bookmark-user / BOOKMARK_USER 指定。"
         )
 
     default_format = "html" if args.legacy_files else "none"
@@ -2637,6 +2808,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         action="store_true",
         help="容器健康检查：正在活跃运行或最近一次成功运行未超时即返回 0",
     )
+    ap.add_argument(
+        "--reset-web-auth",
+        action="store_true",
+        help="重置网页访问密码并生成新的首次初始化口令（忘记密码时使用）",
+    )
     ap.add_argument("-v", "--verbose", action="store_true", help="输出调试日志")
     ap.add_argument("--version", action="version", version=f"ao3_backup {__version__}")
     args = ap.parse_args(list(argv) if argv is not None else None)
@@ -2664,10 +2840,20 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             archive.backup(args.backup_db.expanduser())
             print(f"数据库备份已生成：{args.backup_db}")
             return 0
+        if args.reset_web_auth:
+            if archive is None:
+                ap.error("--reset-web-auth 仅适用于 SQLite 模式")
+            archive.initialize()
+            token = archive.reset_web_auth()
+            print(f"已重置网页访问密码。请使用新的一次性初始化口令登录 /setup：{token}")
+            return 0
         if args.serve:
             from ao3_web import serve
 
             archive.initialize()
+            if not archive.has_web_auth():
+                token = archive.ensure_setup_token()
+                print(f"[SETUP] 首次网页初始化口令（Setup Token）：{token}", flush=True)
             serve(archive, args.host, args.port)
             return 0
         if archive and not args.dry_run:
@@ -2675,13 +2861,24 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
         ap.exit(1, f"{exc}\n")
 
-    cfg = build_config(args)
+    cfg = build_config(args, archive)
+    if archive is not None and (args.once or args.dry_run):
+        saved = archive.backup_settings()
+        if saved is not None:
+            try:
+                creds = archive.decrypted_ao3_credentials()
+            except RuntimeError as exc:
+                ap.exit(1, f"{exc}\n")
+            cfg = configured_backup(cfg, saved, creds)
+        elif archive.ao3_credentials_status()["configured"]:
+            creds = archive.decrypted_ao3_credentials()
+            cfg = replace(cfg, auth_mode=creds[0], user=creds[1], password=creds[2])
     setup_logging(cfg, args.verbose)
     prefer_ipv4(cfg.prefer_ipv4)
 
     log.info("=" * 62)
     log.info("AO3 书签备份器 v%s%s", __version__, " [DRY-RUN]" if cfg.dry_run else "")
-    log.info("书签用户: %s", cfg.bookmark_user)
+    log.info("书签用户: %s", cfg.bookmark_user or "（等待网页初始化配置）")
     log.info("输出目录: %s", cfg.out_dir)
     log.info("附件格式: %s", ", ".join(cfg.formats) or "关闭")
     if not cfg.once and (archive is None or cfg.dry_run):
@@ -2707,7 +2904,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     def execute_pass(cfg: Config, action: str = "scan", *, lock_held: bool = False) -> tuple[bool, dict[str, int]]:
         lock_ctx = contextlib.nullcontext() if cfg.dry_run or lock_held else acquire_lock(cfg.lock_file)
         with lock_ctx:
+            prev_user, prev_mode = client.cfg.user, client.cfg.auth_mode
             client.cfg = cfg
+            if cfg.user != prev_user or cfg.auth_mode != prev_mode:
+                client.reload_cookies(force=True)
+            else:
+                client.reload_cookies(force=False)
             state = archive.scan_state(cfg.bookmark_user) if archive else load_state(cfg, log)
             if archive and not cfg.dry_run:
                 archive.bind_user(cfg.bookmark_user)
@@ -2717,11 +2919,23 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 if client.has_credentials() and not client.logged_in:
                     if not client.login():
                         raise RuntimeError("AO3 登录失败，为避免漏掉私有书签与受限作品，本轮中止")
+                elif cfg.auth_mode == "cookie":
+                    if not client.verify_cookie_session():
+                        if archive is not None:
+                            archive.mark_ao3_cookie_expired(True)
+                        raise CookieExpiredError("AO3 登录 Cookie 已过期（仅 Cookie 模式），请在网页「账号与安全」重新登录")
+                    if archive is not None:
+                        archive.mark_ao3_cookie_expired(False)
 
-                if action == "retry":
-                    stats, page_ok = retry_works(cfg, client, archive, state, stop)
-                else:
-                    stats, page_ok = run_once(cfg, client, state, stop, archive=archive)
+                try:
+                    if action == "retry":
+                        stats, page_ok = retry_works(cfg, client, archive, state, stop)
+                    else:
+                        stats, page_ok = run_once(cfg, client, state, stop, archive=archive)
+                except CookieExpiredError:
+                    if archive is not None:
+                        archive.mark_ao3_cookie_expired(True)
+                    raise
 
                 if cfg.dry_run:
                     log.info(
@@ -2743,7 +2957,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     write_index(cfg, state)
                     write_manifest(cfg, state)
                     prune_retired_files(cfg, state)
-                if client.has_credentials() and client.logged_in:
+                if (client.has_credentials() or cfg.auth_mode == "cookie") and client.logged_in:
                     client.save_cookies()
 
                 # 仅在分页正常扫完、未被信号中断、且并非全军覆没时才刷新健康检查时间戳

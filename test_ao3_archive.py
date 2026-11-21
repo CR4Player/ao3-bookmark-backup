@@ -674,6 +674,210 @@ class SQLiteArchiveTests(unittest.TestCase):
         self.assertEqual(scheduler["next_run"], 0)
         self.assertEqual((last["action"], last["source"], last["status"]), ("scan", "manual", "success"))
 
+    def test_encrypted_and_cookie_credentials_storage(self):
+        self.archive.set_ao3_credentials("encrypted", "my_ao3_user", "SuperSecretAO3!")
+        key_file = self.out / ".credentials.key"
+        self.assertTrue(key_file.is_file())
+        with self.archive.connect(readonly=True) as db:
+            raw_row = db.execute("SELECT value FROM settings WHERE key='ao3_credentials'").fetchone()[0]
+        self.assertNotIn("SuperSecretAO3!", raw_row)
+
+        status = self.archive.ao3_credentials_status()
+        self.assertEqual(status["auth_mode"], "encrypted")
+        self.assertEqual(status["user"], "my_ao3_user")
+        self.assertTrue(status["has_password"])
+        self.assertNotIn("SuperSecretAO3!", json.dumps(status))
+
+        self.assertEqual(
+            self.archive.decrypted_ao3_credentials(),
+            ("encrypted", "my_ao3_user", "SuperSecretAO3!"),
+        )
+
+        # Updating username without re-typing password preserves encrypted secret.
+        self.archive.set_ao3_credentials("encrypted", "renamed_user", "")
+        self.assertEqual(
+            self.archive.decrypted_ao3_credentials(),
+            ("encrypted", "renamed_user", "SuperSecretAO3!"),
+        )
+
+        # Cookie-only mode discards password completely and supports expiry tracking.
+        (self.out / "cookies.txt").write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+        self.archive.set_ao3_credentials("cookie", "cookie_user")
+        self.assertEqual(self.archive.decrypted_ao3_credentials(), ("cookie", "cookie_user", ""))
+        self.assertFalse(self.archive.ao3_credentials_status()["has_password"])
+        self.archive.mark_ao3_cookie_expired(True)
+        self.assertTrue(self.archive.ao3_credentials_status()["cookie_expired"])
+
+        # Switching to public cleans credentials and cookie file when requested.
+        self.archive.set_ao3_credentials("public", clear_cookie_file=True)
+        self.assertEqual(self.archive.decrypted_ao3_credentials(), ("public", "", ""))
+        self.assertFalse((self.out / "cookies.txt").exists())
+
+    def test_web_auth_setup_login_password_rotation_and_reset(self):
+        token1 = self.archive.ensure_setup_token()
+        self.assertEqual(token1, self.archive.ensure_setup_token())
+        self.assertFalse(self.archive.verify_setup_token("WRONG-TOKEN"))
+        self.assertTrue(self.archive.verify_setup_token(token1.lower().replace("-", "")))
+
+        sess1 = self.archive.setup_web_auth("sitepass123")
+        self.assertTrue(self.archive.has_web_auth())
+        self.assertFalse((self.out / ".setup_token").exists())
+        self.assertTrue(self.archive.verify_session_token(sess1))
+        self.assertFalse(self.archive.verify_session_token(sess1[:-1] + ("0" if sess1[-1] != "0" else "1")))
+
+        sess2 = self.archive.change_web_password("sitepass123", "newpass456")
+        self.assertFalse(self.archive.verify_session_token(sess1))
+        self.assertTrue(self.archive.verify_session_token(sess2))
+
+        token2 = self.archive.reset_web_auth()
+        self.assertFalse(self.archive.has_web_auth())
+        self.assertTrue(self.archive.verify_setup_token(token2))
+
+    def test_http_site_auth_setup_login_and_account_flows(self):
+        import http.cookiejar
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        from ao3_web import serve
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        login_calls = []
+
+        def fake_ao3_login(out_dir, user, password, *, timeout=60, prefer_v4=True):
+            login_calls.append((user, password))
+            (out_dir / "cookies.txt").write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+
+        server_box = {}
+        bound = threading.Event()
+
+        def on_bind(srv):
+            server_box["srv"] = srv
+            bound.set()
+
+        thread = threading.Thread(
+            target=serve,
+            args=(self.archive, "127.0.0.1", 0),
+            kwargs={"ao3_login_fn": fake_ao3_login, "on_bind": on_bind},
+            daemon=True,
+        )
+        thread.start()
+        self.assertTrue(bound.wait(3))
+        srv = server_box["srv"]
+        base = f"http://127.0.0.1:{srv.server_port}"
+
+        def fetch(opener, path, data=None):
+            encoded = urllib.parse.urlencode(data, doseq=True).encode("utf-8") if data is not None else None
+            req = urllib.request.Request(base + path, data=encoded, method="POST" if data is not None else "GET")
+            try:
+                with opener.open(req, timeout=5) as resp:
+                    return resp.status, resp.headers, resp.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                try:
+                    return exc.code, exc.headers, exc.read().decode("utf-8")
+                finally:
+                    exc.close()
+
+        try:
+            jar = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), NoRedirect())
+
+            status, _, body = fetch(opener, "/health")
+            self.assertEqual((status, body), (200, "ok\n"))
+
+            status, headers, _ = fetch(opener, "/")
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], "/setup")
+
+            status, _, setup_body = fetch(opener, "/setup")
+            self.assertEqual(status, 200)
+            proof_val = setup_body.split('name="proof" value="', 1)[1].split('"', 1)[0]
+            setup_token = self.archive.ensure_setup_token()
+
+            status, headers, _ = fetch(opener, "/setup", {
+                "proof": proof_val,
+                "setup_token": setup_token,
+                "web_password": "secret-site-password",
+                "web_password_confirm": "secret-site-password",
+                "bookmark_user": "alice_bm",
+                "ao3_auth_mode": "cookie",
+                "ao3_user": "alice_ao3",
+                "ao3_password": "ao3-one-time-password",
+                "formats": ["epub"],
+            })
+            self.assertEqual((status, headers["Location"]), (303, "/"))
+            self.assertEqual(login_calls, [("alice_ao3", "ao3-one-time-password")])
+            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("cookie", "alice_ao3", ""))
+
+            status, _, home_body = fetch(opener, "/")
+            self.assertEqual(status, 200)
+            self.assertIn("alice_bm", home_body)
+            self.assertIn("账号安全", home_body)
+
+            # Unauthenticated browser cannot access home or API status.
+            anon = urllib.request.build_opener(NoRedirect())
+            status, headers, _ = fetch(anon, "/")
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], "/login")
+            status, _, _ = fetch(anon, "/backup/status")
+            self.assertEqual(status, 401)
+
+            # New browser logs in with wrong then correct password, updates backup settings & rotates site password.
+            jar2 = http.cookiejar.CookieJar()
+            opener2 = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar2), NoRedirect())
+            _, _, login_page = fetch(opener2, "/login")
+            login_proof = login_page.split('name="proof" value="', 1)[1].split('"', 1)[0]
+
+            status, _, _ = fetch(opener2, "/login", {"proof": login_proof, "next": "/", "password": "wrong"})
+            self.assertEqual(status, 401)
+
+            status, headers, _ = fetch(opener2, "/login", {
+                "proof": login_proof, "next": "/", "password": "secret-site-password",
+            })
+            self.assertEqual((status, headers["Location"]), (303, "/"))
+
+            status, _, acct_body = fetch(opener2, "/account")
+            self.assertEqual(status, 200)
+            acct_proof = acct_body.split('name="proof" value="', 1)[1].split('"', 1)[0]
+            status, headers, _ = fetch(opener2, "/account", {
+                "proof": acct_proof,
+                "action": "password",
+                "current_password": "secret-site-password",
+                "new_password": "rotated-password-999",
+                "confirm_password": "rotated-password-999",
+            })
+            self.assertEqual((status, headers["Location"]), (303, "/account?saved=password"))
+
+            # First session cookie was invalidated by password rotation.
+            status, headers, _ = fetch(opener, "/")
+            self.assertEqual(status, 303)
+            self.assertEqual(headers["Location"], "/login")
+        finally:
+            srv.shutdown()
+            thread.join(timeout=2)
+
+    def test_scheduler_awaits_setup_and_handles_cookie_expiry(self):
+        cfg = replace(self.cfg, bookmark_user="", once=False, run_on_start=True)
+        stop = threading.Event()
+        threading.Timer(0.05, stop.set).start()
+        with patch.object(backup, "BACKUP_POLL_SECONDS", 0.01):
+            backup.run_scheduler(cfg, self.archive, stop, lambda c, a: (True, backup.run_stats()))
+        self.assertTrue((self.out / ".setup_pending").exists())
+        self.assertEqual(backup.healthcheck(self.out, 48.0), 0)
+        scheduler, _, _, _ = self.archive.backup_dashboard()
+        self.assertTrue(scheduler.get("awaiting_setup"))
+
+        # Expired cookie marks cookie_expired=True cleanly.
+        self.archive.set_ao3_credentials("cookie", "cookie_user")
+        expired_cfg = replace(self.cfg, auth_mode="cookie", user="cookie_user", password="")
+        fake_client = backup.AO3Client(expired_cfg)
+        with patch.object(fake_client, "get_text", return_value='<form action="/users/login">'):
+            self.assertFalse(fake_client.verify_cookie_session())
+        self.archive.mark_ao3_cookie_expired(True)
+        self.assertTrue(self.archive.ao3_credentials_status()["cookie_expired"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,5 +12,9 @@ __pycache__/
 *.db
 *.zip
 cookies.txt
+.credentials.key
+.setup_token
+.setup_pending
+.last_run
 .backup.lock
 .running

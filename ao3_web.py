@@ -9,9 +9,10 @@ import logging
 import math
 import os
 import re
+import secrets
 import sqlite3
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from html import escape
@@ -19,22 +20,24 @@ from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import zip_longest
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ao3_content import Fragment, reading_html
 from ao3_diff import Difference, Export, chapter_heading, field_differences
 from ao3_store import (
-    ANCHOR_MODES, BACKUP_ACTIONS, BACKUP_LOG, INTERVAL_UNITS, SCHEDULE_MODES,
-    UNIT_SECONDS, WEEKDAY_LABELS, Archive, BackupSettings, DOWNLOAD_FORMATS, Version,
-    compute_next_runs, missing_attachments, parse_duration, parse_hhmm,
-    resolve_schedule, schedule_label,
+    ANCHOR_MODES, AO3_AUTH_MODES, BACKUP_ACTIONS, BACKUP_LOG, INTERVAL_UNITS,
+    SCHEDULE_MODES, UNIT_SECONDS, WEEKDAY_LABELS, Archive, BackupSettings,
+    DOWNLOAD_FORMATS, Version, compute_next_runs, missing_attachments,
+    parse_duration, parse_hhmm, resolve_schedule, schedule_label,
 )
 
 
 LOG = logging.getLogger("ao3.web")
 COOKIE = "ao3_archive_reader"
+SESSION_COOKIE = "ao3_archive_session"
+CSRF_COOKIE = "ao3_web_csrf"
 PER_PAGE = 40
 VIEWS = {"all": "全部作品", "since": "访问后更新", "unread": "未读更新", "failed": "抓取问题"}
 SORTS = {
@@ -135,7 +138,10 @@ def hidden_fields(query: dict[str, str]) -> str:
                    for key, value in query.items())
 
 
-def page(title: str, contents: str, *, detail: bool = False, dashboard: bool = False, reading: bool = False) -> str:
+def page(
+    title: str, contents: str, *, detail: bool = False, dashboard: bool = False,
+    reading: bool = False, auth_mode: str = "app",
+) -> str:
     brand = home_url("all") if detail else "/"
     scripts = ['<script src="/reader.js"></script>']
     if dashboard:
@@ -149,14 +155,19 @@ def page(title: str, contents: str, *, detail: bool = False, dashboard: bool = F
 <option value="crimson">经典绯红（AO3）</option></optgroup>
 <optgroup label="深色方案"><option value="night">深邃灰（夜间）</option><option value="dusk">暮夜星辰（深蓝紫）</option>
 <option value="midnight">暗夜森林（深墨绿）</option></optgroup></select></label>"""
+    nav_links = (
+        '<a class="top-link" href="/">总览</a><a class="top-link" href="/account">账号安全</a>'
+        if auth_mode == "app" else ""
+    )
+    brand_href = escape(brand if auth_mode == "app" else "#")
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)} · AO3 书签备份</title>{script_tags}<link rel="stylesheet" href="/archive.css"></head>
 <body{body_class}><a class="skip" href="#main">跳到内容</a>
 <header class="top"><div class="wrap top-row">
-<a class="brand" href="{escape(brand)}"><span>AO3</span> 书签备份</a>
-<div class="top-actions">{theme_picker}<a class="top-link" href="/">总览</a></div></div></header>
+<a class="brand" href="{brand_href}"><span>AO3</span> 书签备份</a>
+<div class="top-actions">{theme_picker}{nav_links}</div></div></header>
 <main class="wrap" id="main">{contents}</main></body></html>"""
 
 
@@ -280,7 +291,8 @@ def _field_many(fields: dict[str, object], key: str) -> list[str]:
     return [str(value)] if value != "" else []
 
 
-def submitted_settings(fields: dict[str, object]) -> BackupSettings:
+def submitted_settings(fields: dict[str, object], *, base: BackupSettings | None = None) -> BackupSettings:
+    prior = base or BackupSettings()
     try:
         delay = float(_field_first(fields, "delay", ""))
         retries = int(_field_first(fields, "retries", ""))
@@ -291,6 +303,55 @@ def submitted_settings(fields: dict[str, object]) -> BackupSettings:
         raise ValueError("请求间隔应在 0.1 至 600 秒之间")
     if not 1 <= retries <= 20 or not 1 <= max_errors <= 100:
         raise ValueError("请求尝试次数应为 1 至 20，连续失败上限应为 1 至 100")
+
+    bookmark_user = prior.bookmark_user
+    if "bookmark_user" in fields:
+        bookmark_user = _field_first(fields, "bookmark_user", "").strip()
+        if not bookmark_user:
+            raise ValueError("请填写目标书签用户名（BOOKMARK_USER）")
+
+    formats = prior.formats
+    formats_configured = prior.formats_configured
+    if "formats_present" in fields or "formats" in fields:
+        selected = [
+            f.strip().lower() for f in _field_many(fields, "formats")
+            if f.strip().lower() in DOWNLOAD_FORMATS
+        ]
+        formats = tuple(dict.fromkeys(selected))
+        formats_configured = True
+
+    run_on_start = prior.run_on_start
+    prefer_ipv4_opt = prior.prefer_ipv4
+    if "advanced_present" in fields:
+        run_on_start = _field_first(fields, "run_on_start", "") == "1"
+        prefer_ipv4_opt = _field_first(fields, "prefer_ipv4", "") == "1"
+
+    stop_idle = prior.stop_after_idle_pages
+    if "stop_after_idle_pages" in fields:
+        try:
+            stop_idle = int(_field_first(fields, "stop_after_idle_pages", "0"))
+        except ValueError as exc:
+            raise ValueError("连续无变化停止页数应为非负整数") from exc
+        if not 0 <= stop_idle <= 500:
+            raise ValueError("连续无变化停止页数应在 0 至 500 之间")
+
+    max_pages = prior.max_pages
+    if "max_pages" in fields:
+        try:
+            max_pages = int(_field_first(fields, "max_pages", "200"))
+        except ValueError as exc:
+            raise ValueError("最大翻页数应为整数") from exc
+        if not 1 <= max_pages <= 5000:
+            raise ValueError("最大翻页数应在 1 至 5000 之间")
+
+    timeout = prior.timeout
+    if "timeout" in fields:
+        try:
+            timeout = int(_field_first(fields, "timeout", "60"))
+        except ValueError as exc:
+            raise ValueError("请求超时时间应为整数") from exc
+        if not 5 <= timeout <= 600:
+            raise ValueError("请求超时时间应在 5 至 600 秒之间")
 
     if "schedule_mode" not in fields:
         hour, minute = parse_hhmm(_field_first(fields, "run_at", ""))
@@ -305,6 +366,14 @@ def submitted_settings(fields: dict[str, object]) -> BackupSettings:
             retries=retries,
             max_errors=max_errors,
             schedule_mode="interval" if seconds > 0 else "daily",
+            bookmark_user=bookmark_user,
+            formats=formats,
+            formats_configured=formats_configured,
+            run_on_start=run_on_start,
+            stop_after_idle_pages=stop_idle,
+            max_pages=max_pages,
+            timeout=timeout,
+            prefer_ipv4=prefer_ipv4_opt,
         )
 
     mode = _field_first(fields, "schedule_mode").strip()
@@ -394,6 +463,14 @@ def submitted_settings(fields: dict[str, object]) -> BackupSettings:
         anchor_mode=anchor,
         weekdays=weekdays,
         month_day=month_day,
+        bookmark_user=bookmark_user,
+        formats=formats,
+        formats_configured=formats_configured,
+        run_on_start=run_on_start,
+        stop_after_idle_pages=stop_idle,
+        max_pages=max_pages,
+        timeout=timeout,
+        prefer_ipv4=prefer_ipv4_opt,
     )
 
 
@@ -426,10 +503,13 @@ def backup_status(
 
     running = next((job for job in active if job["status"] == "running"), None)
     online = bool(scheduler) and time.time() - scheduler["seen_at"] < 45
+    awaiting = bool(scheduler.get("awaiting_setup")) and not running
     tone = ("running" if running else
+            "waiting" if awaiting else
             "online" if online else
             "offline" if scheduler else "waiting")
     state = (f"执行中 · {label(running)}（{date_label(running['started_at'])} 开始）" if running else
+             "等待完成目标书签初始化" if awaiting else
              "备份进程空闲" if online and not active else "等待备份进程领取任务" if online else
              "备份进程暂未响应" if scheduler else "等待备份进程启动")
     queued = [label(job) for job in active if job["status"] == "queued"]
@@ -441,7 +521,9 @@ def backup_status(
         previous += " · " + last["summary"]
     is_manual = bool(settings and resolve_schedule(settings)["mode"] == "manual")
     due = scheduler.get("next_run", 0)
-    if is_manual:
+    if awaiting:
+        upcoming = "下次计划 · 请先配置目标书签用户名"
+    elif is_manual:
         upcoming = "下次计划 · 本轮结束后保持手动" if running else "下次计划 · 已关闭自动定时（仅手动）"
     else:
         upcoming = (f"下次计划 · {date_label(due)}" if (online or running) and due > time.time() else
@@ -469,9 +551,31 @@ def recent_backup_log(archive: Archive) -> str:
     return log or "等待备份进程输出日志。"
 
 
+def _initial_formats(archive: Archive, settings: BackupSettings, scheduler: dict | None = None) -> set[str]:
+    if settings.formats_configured:
+        return {f for f in settings.formats if f in DOWNLOAD_FORMATS}
+    sched_formats = (scheduler or {}).get("formats")
+    if sched_formats is not None:
+        return {str(f).lower() for f in sched_formats if str(f).lower() in DOWNLOAD_FORMATS}
+    raw_env = os.environ.get("FORMATS", "").strip().lower()
+    if raw_env and raw_env != "none":
+        return {part.strip() for part in raw_env.split(",") if part.strip() in DOWNLOAD_FORMATS}
+    return set()
+
+
+def _initial_bookmark_user(archive: Archive, settings: BackupSettings) -> str:
+    return (
+        settings.bookmark_user
+        or archive.stored_bookmark_user()
+        or os.environ.get("BOOKMARK_USER", "").strip()
+        or os.environ.get("AO3_USER", "").strip()
+    )
+
+
 def backup_panel(
     archive: Archive, reader: dict, context: dict[str, str], settings: BackupSettings,
     status: dict[str, str], notice: str, *, error: str = "", form_values: dict[str, object] | None = None,
+    scheduler: dict | None = None,
 ) -> str:
     proof_field = hidden_fields({"proof": backup_proof(reader["id"])})
     post_url = escape(with_query("/backup", context))
@@ -507,6 +611,21 @@ def backup_panel(
     delay_str = _field_first(vals, "delay", str(settings.delay))
     retries_str = _field_first(vals, "retries", str(settings.retries))
     max_errors_str = _field_first(vals, "max_errors", str(settings.max_errors))
+
+    bookmark_user_str = _field_first(vals, "bookmark_user", _initial_bookmark_user(archive, settings))
+    if "formats_present" in vals or "formats" in vals:
+        selected_formats = {f.strip().lower() for f in _field_many(vals, "formats") if f.strip().lower() in DOWNLOAD_FORMATS}
+    else:
+        selected_formats = _initial_formats(archive, settings, scheduler)
+    if "advanced_present" in vals:
+        run_on_start_checked = _field_first(vals, "run_on_start", "") == "1"
+        prefer_ipv4_checked = _field_first(vals, "prefer_ipv4", "") == "1"
+    else:
+        run_on_start_checked = settings.run_on_start
+        prefer_ipv4_checked = settings.prefer_ipv4
+    stop_idle_str = _field_first(vals, "stop_after_idle_pages", str(settings.stop_after_idle_pages))
+    max_pages_str = _field_first(vals, "max_pages", str(settings.max_pages))
+    timeout_str = _field_first(vals, "timeout", str(settings.timeout))
     settings_open = " open" if error else ""
 
     mode_buttons = "".join(
@@ -539,6 +658,11 @@ def backup_panel(
         f"</option>"
         for d in range(1, 32)
     )
+    format_chips = "".join(
+        f'<label class="format-chip"><input type="checkbox" name="formats" value="{fmt}"'
+        f'{" checked" if fmt in selected_formats else ""}><span>{fmt.upper()}</span></label>'
+        for fmt in ("html", "epub", "pdf", "mobi", "azw3")
+    )
     hide_run_at = mode == "manual" or (mode == "interval" and anchor_mode == "after")
     run_at_titles = {
         "interval": ("基准时刻", "固定按此时刻对齐间隔网格，避免越跑越晚"),
@@ -554,7 +678,7 @@ def backup_panel(
         preview_text = format_preview_runs(settings)
     else:
         try:
-            preview_settings = submitted_settings(vals)
+            preview_settings = submitted_settings(vals, base=settings)
         except ValueError:
             pass
         preview_text = format_preview_runs(preview_settings)
@@ -583,7 +707,23 @@ def backup_panel(
 <div class="backup-details">
 <details id="backup-settings"{settings_open}><summary>抓取设置</summary>
 <form class="backup-form" id="backup-settings-form" method="post" action="{post_url}">{proof_field}
+  <input type="hidden" name="formats_present" value="1">
+  <input type="hidden" name="advanced_present" value="1">
   <div class="settings-groups">
+    <fieldset class="settings-group is-wide">
+      <legend>目标与附件</legend>
+      <div class="settings-fields is-target-row">
+        <label><span class="field-label">目标书签用户名（BOOKMARK_USER）</span>
+          <input name="bookmark_user" value="{escape(bookmark_user_str)}" placeholder="填写 AO3 个人主页中的用户名" required>
+          <small>即 AO3 书签 URL 中的用户名；需要调整登录账号或站点密码请前往 <a class="text-link" href="/account">账号安全</a></small>
+        </label>
+        <div class="format-picker">
+          <span class="field-label">额外下载官方附件格式</span>
+          <div class="format-chips" role="group" aria-label="附件格式">{format_chips}</div>
+          <small>全不选时仅保存可在线阅读、版本对比及导出 Markdown/JSON 的正文数据</small>
+        </div>
+      </div>
+    </fieldset>
     <fieldset class="settings-group">
       <legend>调度计划</legend>
       <div class="schedule-stack">
@@ -638,6 +778,27 @@ def backup_panel(
           <small>达上限暂停重试</small>
         </label>
       </div>
+      <details class="advanced-settings">
+        <summary>高级抓取策略</summary>
+        <div class="settings-fields is-three">
+          <label><span class="field-label">最大翻页数</span>
+            <span class="input-unit"><input type="number" name="max_pages" value="{escape(max_pages_str)}" min="1" max="5000" required><span>页</span></span>
+            <small>每页 20 条书签</small>
+          </label>
+          <label><span class="field-label">无更新提前停止</span>
+            <span class="input-unit"><input type="number" name="stop_after_idle_pages" value="{escape(stop_idle_str)}" min="0" max="500" required><span>页</span></span>
+            <small>0 为扫完全部书签</small>
+          </label>
+          <label><span class="field-label">单次请求超时</span>
+            <span class="input-unit"><input type="number" name="timeout" value="{escape(timeout_str)}" min="5" max="600" required><span>秒</span></span>
+            <small>默认 60 秒</small>
+          </label>
+        </div>
+        <div class="advanced-checks">
+          <label class="inline-check"><input type="checkbox" name="run_on_start" value="1"{' checked' if run_on_start_checked else ''}><span>容器启动后先执行一轮抓取</span></label>
+          <label class="inline-check"><input type="checkbox" name="prefer_ipv4" value="1"{' checked' if prefer_ipv4_checked else ''}><span>优先 IPv4 解析（规避部分代理 IPv6 超时）</span></label>
+        </div>
+      </details>
     </fieldset>
   </div>
   <div class="backup-form-footer">
@@ -809,13 +970,26 @@ def overview_html(
 </div>"""
 
     panel = backup_panel(archive, reader, page_context, settings, backup_status(scheduler, active_jobs, last, settings),
-                         notice, error=backup_error, form_values=backup_values)
+                         notice, error=backup_error, form_values=backup_values, scheduler=scheduler)
+    creds = archive.ao3_credentials_status()
+    env_creds = bool(os.environ.get("AO3_USER", "").strip() and os.environ.get("AO3_PASSWORD", ""))
+    credential_banner = ""
+    if creds["auth_mode"] == "cookie" and creds["cookie_expired"]:
+        credential_banner = (
+            '<p class="warning notice" role="alert">AO3 登录 Cookie 已过期（当前为仅 Cookie 模式），私有书签与受限作品已暂停抓取。'
+            ' <a class="button small" href="/account">前往重新登录更新 Cookie</a></p>'
+        )
+    elif not creds["configured"] and env_creds:
+        credential_banner = (
+            '<p class="notice is-info">检测到环境变量仍存有明文 AO3 账号，建议前往 '
+            '<a class="text-link" href="/account">账号安全</a> 转为加密存储或仅保存 Cookie 后从 .env 移除。</p>'
+        )
     count_label = (f"第 {current_page}/{total_pages} 页 · 共 {total_matched} 篇"
                    if total_pages > 1 else f"{total_matched} 篇作品")
     pagination = _pagination_html(page_context, current_page, total_pages)
     return page("作品总览", f"""
 <div class="page-heading"><h1>作品总览</h1><span class="muted">{count_label}</span></div>
-{panel}{toolbar}{filters}{visit_bar}
+{credential_banner}{panel}{toolbar}{filters}{visit_bar}
 <section class="results" aria-label="{VIEWS[view]}">
 <ul class="work-list" role="list">{rendered}</ul>{pagination}</section>""", dashboard=True)
 
@@ -1293,7 +1467,224 @@ def article_html(
     return page(title, contents, detail=True, reading=True)
 
 
-def serve(archive: Archive, host: str, port: int) -> None:
+def _safe_next(raw: str) -> str:
+    val = (raw or "").strip()
+    if (not val or not val.startswith("/") or val.startswith("//")
+            or any(c in val for c in ("\r", "\n", "\\"))
+            or val.split("?", 1)[0] in {"/login", "/setup", "/logout"}):
+        return "/"
+    return val
+
+
+def _ao3_cred_fields(
+    *, auth_mode: str, ao3_user: str, has_saved_password: bool = False, require_password_if_empty: bool = False,
+) -> str:
+    mode_buttons = "".join(
+        f'<label class="schedule-mode-pill"><input type="radio" name="ao3_auth_mode" value="{k}"'
+        f'{" checked" if auth_mode == k else ""}><span>{label}</span></label>'
+        for k, label in (
+            ("public", "仅公开书签（不登录）"),
+            ("encrypted", "加密保存密码（支持自动重登）"),
+            ("cookie", "仅登录保存 Cookie（不存密码）"),
+        )
+    )
+    pw_placeholder = (
+        "已加密保存（留空保持原密码）" if (auth_mode == "encrypted" and has_saved_password and not require_password_if_empty)
+        else "输入 AO3 登录密码"
+    )
+    return f"""<div class="ao3-auth-box" data-ao3-auth-scope>
+  <span class="field-label">AO3 登录方式</span>
+  <div class="schedule-modes" role="radiogroup" aria-label="AO3 登录方式">{mode_buttons}</div>
+  <p class="muted auth-mode-desc" data-ao3-mode-hint></p>
+  <div class="settings-fields" data-ao3-cred-fields{' hidden' if auth_mode == 'public' else ''}>
+    <label><span class="field-label">AO3 登录用户名</span>
+      <input name="ao3_user" value="{escape(ao3_user)}" autocomplete="username" placeholder="AO3 账号用户名">
+    </label>
+    <label><span class="field-label">AO3 登录密码</span>
+      <input type="password" name="ao3_password" value="" autocomplete="current-password"
+             placeholder="{escape(pw_placeholder)}" data-has-saved="{1 if has_saved_password else 0}">
+      <small data-ao3-pw-hint></small>
+    </label>
+  </div>
+</div>"""
+
+
+def login_html(proof_token: str, *, next_url: str = "/", error: str = "") -> str:
+    err_html = f'<p class="warning notice" role="alert">{escape(error)}</p>' if error else ""
+    fields = hidden_fields({"proof": proof_token, "next": _safe_next(next_url)})
+    return page("访问验证", f"""
+<section class="auth-shell">
+  <div class="auth-card">
+    <h1>访问验证</h1>
+    <p class="muted">此 AO3 书签归档已启用全站密码保护，请输入站点访问密码后继续。</p>
+    {err_html}
+    <form class="auth-form" method="post" action="/login">{fields}
+      <label><span class="field-label">站点访问密码</span>
+        <input type="password" name="password" required autofocus autocomplete="current-password" placeholder="输入站点访问密码">
+      </label>
+      <div class="auth-actions">
+        <button class="button primary" type="submit">登录</button>
+      </div>
+    </form>
+  </div>
+</section>""", auth_mode="public")
+
+
+def setup_html(
+    proof_token: str, *, bookmark_user: str = "", auth_mode: str = "public", ao3_user: str = "",
+    formats: set[str] | None = None, has_existing_data: bool = False, error: str = "",
+) -> str:
+    err_html = f'<p class="warning notice" role="alert">{escape(error)}</p>' if error else ""
+    upgrade_hint = (
+        '<p class="notice is-info">检测到现有归档数据或环境变量，请先设置站点访问密码完成锁定并确认配置。</p>'
+        if has_existing_data else ""
+    )
+    selected_formats = formats or set()
+    format_chips = "".join(
+        f'<label class="format-chip"><input type="checkbox" name="formats" value="{fmt}"'
+        f'{" checked" if fmt in selected_formats else ""}><span>{fmt.upper()}</span></label>'
+        for fmt in ("html", "epub", "pdf", "mobi", "azw3")
+    )
+    cred_html = _ao3_cred_fields(auth_mode=auth_mode, ao3_user=ao3_user, require_password_if_empty=True)
+    fields = hidden_fields({"proof": proof_token, "formats_present": "1"})
+    return page("初始化设置", f"""
+<section class="auth-shell is-wide">
+  <div class="auth-card">
+    <h1>欢迎使用 AO3 书签备份</h1>
+    <p class="muted">首次运行需要设置全站访问密码并确认抓取目标；所有设置会保存在持久化数据库中，环境变量无需填写明文密码。</p>
+    {upgrade_hint}{err_html}
+    <form class="auth-form" method="post" action="/setup">{fields}
+      <fieldset class="settings-group">
+        <legend>1. 初始化校验与全站密码</legend>
+        <div class="settings-fields is-three">
+          <label><span class="field-label">初始化口令（Setup Token）</span>
+            <input name="setup_token" required autocomplete="off" placeholder="例：ABCD-1234-EF56">
+            <small>请查看容器启动日志（[SETUP] 行）</small>
+          </label>
+          <label><span class="field-label">设置站点访问密码</span>
+            <input type="password" name="web_password" minlength="6" required autocomplete="new-password" placeholder="至少 6 位字符">
+            <small>保护整站阅读与设置修改</small>
+          </label>
+          <label><span class="field-label">确认站点访问密码</span>
+            <input type="password" name="web_password_confirm" minlength="6" required autocomplete="new-password" placeholder="再次输入">
+          </label>
+        </div>
+      </fieldset>
+      <fieldset class="settings-group">
+        <legend>2. 书签目标与 AO3 账号</legend>
+        <div class="auth-stack">
+          <label><span class="field-label">目标书签用户名（BOOKMARK_USER）</span>
+            <input name="bookmark_user" value="{escape(bookmark_user)}" required placeholder="填写 AO3 个人主页用户名">
+            <small>对应 https://archiveofourown.org/users/用户名/bookmarks</small>
+          </label>
+          {cred_html}
+        </div>
+      </fieldset>
+      <fieldset class="settings-group">
+        <legend>3. 官方附件下载（可选）</legend>
+        <div class="format-chips" role="group" aria-label="附件格式">{format_chips}</div>
+        <small>默认全不选仅保留正文、差异对比及 Markdown/JSON 导出，需要同步下载官方原文件再勾选。</small>
+      </fieldset>
+      <div class="auth-actions">
+        <button class="button primary" type="submit">完成初始化并进入总览</button>
+      </div>
+    </form>
+  </div>
+</section>""", auth_mode="public")
+
+
+def account_html(
+    archive: Archive, reader: dict, *, creds_status: dict, notice: str = "", error: str = "",
+    auth_mode: str = "", ao3_user: str = "",
+) -> str:
+    proof_val = backup_proof(reader["id"])
+    proof_field = hidden_fields({"proof": proof_val})
+    effective_mode = auth_mode if auth_mode in AO3_AUTH_MODES else (creds_status["auth_mode"] or "public")
+    effective_user = ao3_user or creds_status["user"] or os.environ.get("AO3_USER", "").strip()
+    env_creds = bool(os.environ.get("AO3_USER", "").strip() and os.environ.get("AO3_PASSWORD", ""))
+
+    if creds_status["auth_mode"] == "encrypted":
+        status_pill = f'<span class="cred-badge is-ok">加密托管中 · {escape(creds_status["user"])}</span>'
+    elif creds_status["auth_mode"] == "cookie":
+        if creds_status["cookie_expired"]:
+            status_pill = f'<span class="cred-badge is-warn">Cookie 已过期 · 请重新登录 ({escape(creds_status["user"])})</span>'
+        else:
+            status_pill = f'<span class="cred-badge is-ok">仅 Cookie 模式有效 · {escape(creds_status["user"])}</span>'
+    elif env_creds:
+        status_pill = '<span class="cred-badge is-info">当前回退使用环境变量账号</span>'
+    else:
+        status_pill = '<span class="cred-badge">仅公开书签模式（未登录）</span>'
+
+    msg_html = ""
+    if error:
+        msg_html = f'<p class="warning notice" role="alert">{escape(error)}</p>'
+    elif notice == "credentials":
+        msg_html = '<p class="notice is-info" role="status">AO3 登录凭据设置已更新。</p>'
+    elif notice == "password":
+        msg_html = '<p class="notice is-info" role="status">站点访问密码已更新，其余设备会话已自动失效。</p>'
+
+    env_tip = (
+        '<p class="notice is-info">提示：环境变量中仍检测到 AO3_USER / AO3_PASSWORD。保存此处设置后，可从 .env 删除明文账号。</p>'
+        if env_creds and not creds_status["configured"] else ""
+    )
+    cred_fields = _ao3_cred_fields(
+        auth_mode=effective_mode,
+        ao3_user=effective_user,
+        has_saved_password=creds_status["has_password"],
+    )
+
+    return page("账号与安全", f"""
+<div class="page-heading">
+  <h1>账号与安全</h1>
+  <form method="post" action="/logout">{proof_field}
+    <button class="button" type="submit">退出当前登录</button>
+  </form>
+</div>
+{msg_html}{env_tip}
+<div class="account-grid">
+  <section class="account-card">
+    <div class="account-card-head">
+      <h2>AO3 抓取凭据</h2>
+      {status_pill}
+    </div>
+    <p class="muted">加密保存使用独立密钥文件（/data/.credentials.key）保护并支持无人值守自动重登；「仅保存 Cookie」不落盘任何 AO3 密码，安全性最高，但 Cookie 失效时需回到此处重登。</p>
+    <form class="auth-form" method="post" action="/account">{proof_field}
+      <input type="hidden" name="action" value="credentials">
+      {cred_fields}
+      <div class="auth-actions">
+        <button class="button primary" type="submit">保存凭据设置</button>
+      </div>
+    </form>
+  </section>
+  <section class="account-card">
+    <div class="account-card-head">
+      <h2>站点访问密码</h2>
+    </div>
+    <p class="muted">用于保护整个归档站点的阅读与管理界面。修改密码后，其他浏览器和设备需重新登录。</p>
+    <form class="auth-form" method="post" action="/account">{proof_field}
+      <input type="hidden" name="action" value="password">
+      <label><span class="field-label">当前访问密码</span>
+        <input type="password" name="current_password" required autocomplete="current-password" placeholder="输入当前密码">
+      </label>
+      <label><span class="field-label">新访问密码</span>
+        <input type="password" name="new_password" minlength="6" required autocomplete="new-password" placeholder="至少 6 位字符">
+      </label>
+      <label><span class="field-label">确认新密码</span>
+        <input type="password" name="confirm_password" minlength="6" required autocomplete="new-password" placeholder="再次输入新密码">
+      </label>
+      <div class="auth-actions">
+        <button class="button primary" type="submit">更新站点密码</button>
+      </div>
+    </form>
+  </section>
+</div>""")
+
+
+def serve(
+    archive: Archive, host: str, port: int, *,
+    ao3_login_fn: Callable[..., None] | None = None,
+    on_bind: Callable[[ThreadingHTTPServer], None] | None = None,
+) -> None:
     css = Path(__file__).with_name("ao3_web.css").read_bytes()
     backup_script = Path(__file__).with_name("ao3_web.js").read_bytes()
     reader_script = Path(__file__).with_name("ao3_reader.js").read_bytes()
@@ -1301,6 +1692,14 @@ def serve(archive: Archive, host: str, port: int) -> None:
         item.strip().casefold() for item in os.environ.get("WEB_ALLOWED_HOSTS", "").split(",") if item.strip()
     }
     secure = "; Secure" if os.environ.get("WEB_COOKIE_SECURE") == "1" else ""
+    csrf_secret = secrets.token_bytes(32)
+
+    def _default_login(out_dir: Path, user: str, password: str, *, timeout: int = 60, prefer_v4: bool = True) -> None:
+        from ao3_backup import verify_login_and_save_cookies
+
+        verify_login_and_save_cookies(out_dir, user, password, timeout=timeout, prefer_v4=prefer_v4)
+
+    login_checker = ao3_login_fn or _default_login
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -1315,13 +1714,48 @@ def serve(archive: Archive, host: str, port: int) -> None:
             except ValueError:
                 return False
 
-        def cookie(self) -> str:
+        def _cookie_value(self, name: str, pattern: str) -> str:
             try:
                 cookies = SimpleCookie(self.headers.get("Cookie", ""))
-                value = cookies[COOKIE].value if COOKIE in cookies else ""
+                value = cookies[name].value if name in cookies else ""
             except CookieError:
                 return ""
-            return value if re.fullmatch(r"[0-9a-f]{32}", value) else ""
+            return value if re.fullmatch(pattern, value) else ""
+
+        def cookie(self) -> str:
+            return self._cookie_value(COOKIE, r"[0-9a-f]{32}")
+
+        def session_cookie(self) -> str:
+            return self._cookie_value(SESSION_COOKIE, r"[0-9]+\.[0-9]+\.[0-9a-f]{64}")
+
+        def is_authenticated(self) -> bool:
+            return archive.verify_session_token(self.session_cookie())
+
+        def session_headers(self, token: str) -> dict[str, str]:
+            return {
+                "Set-Cookie": f"{SESSION_COOKIE}={token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict{secure}",
+            }
+
+        def clear_session_headers(self) -> dict[str, str]:
+            return {
+                "Set-Cookie": f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}",
+            }
+
+        def pre_auth_csrf(self) -> tuple[str, str, dict[str, str]]:
+            cid = self._cookie_value(CSRF_COOKIE, r"[0-9a-f]{32}")
+            headers: dict[str, str] = {}
+            if not cid:
+                cid = secrets.token_hex(16)
+                headers["Set-Cookie"] = f"{CSRF_COOKIE}={cid}; Path=/; HttpOnly; SameSite=Strict{secure}"
+            token = hmac.new(csrf_secret, cid.encode("ascii"), "sha256").hexdigest()
+            return cid, token, headers
+
+        def verify_pre_auth_csrf(self, proof_val: str) -> bool:
+            cid = self._cookie_value(CSRF_COOKIE, r"[0-9a-f]{32}")
+            if not cid or not re.fullmatch(r"[0-9a-f]{64}", proof_val or ""):
+                return False
+            expected = hmac.new(csrf_secret, cid.encode("ascii"), "sha256").hexdigest()
+            return hmac.compare_digest(proof_val, expected)
 
         def reader_context(self, *, visit: bool = False) -> tuple[dict, dict[str, str]]:
             reader, new = archive.reader(self.cookie(), visit=visit)
@@ -1330,7 +1764,7 @@ def serve(archive: Archive, host: str, port: int) -> None:
             return reader, headers
 
         def respond(self, status: int, body: str | bytes, mime: str = "text/html; charset=utf-8",
-                    headers: dict[str, str] | None = None, *, policy: str = PAGE_POLICY) -> None:
+                    headers: dict[str, str] | list[tuple[str, str]] | None = None, *, policy: str = PAGE_POLICY) -> None:
             raw = body.encode() if isinstance(body, str) else body
             self.send_response(status)
             self.send_header("Content-Type", mime)
@@ -1340,7 +1774,8 @@ def serve(archive: Archive, host: str, port: int) -> None:
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
-            for key, value in (headers or {}).items():
+            header_items = headers.items() if isinstance(headers, dict) else (headers or ())
+            for key, value in header_items:
                 self.send_header(key, value)
             self.end_headers()
             self.wfile.write(raw)
@@ -1369,11 +1804,57 @@ def serve(archive: Archive, host: str, port: int) -> None:
             if path == "/archive.css":
                 self.respond(200, css, "text/css; charset=utf-8")
                 return
-            if path == "/backup.js":
-                self.respond(200, backup_script, "text/javascript; charset=utf-8")
-                return
             if path == "/reader.js":
                 self.respond(200, reader_script, "text/javascript; charset=utf-8")
+                return
+
+            has_auth = archive.has_web_auth()
+            if not has_auth:
+                archive.ensure_setup_token()
+                if path != "/setup":
+                    if path == "/backup/status":
+                        self.respond(401, json.dumps({"error": "setup_required"}), "application/json; charset=utf-8")
+                    else:
+                        self.respond(303, "", headers={"Location": "/setup"})
+                    return
+                _, csrf_token, csrf_headers = self.pre_auth_csrf()
+                scheduler, cur_settings, _, _ = archive.backup_dashboard()
+                b_user = _initial_bookmark_user(archive, cur_settings)
+                creds = archive.ao3_credentials_status()
+                a_mode = creds["auth_mode"] or ("encrypted" if os.environ.get("AO3_PASSWORD") else "public")
+                a_user = creds["user"] or os.environ.get("AO3_USER", "").strip()
+                fmts = _initial_formats(archive, cur_settings, scheduler)
+                has_existing = bool(b_user or archive.has_works())
+                self.respond(200, setup_html(
+                    csrf_token, bookmark_user=b_user, auth_mode=a_mode, ao3_user=a_user,
+                    formats=fmts, has_existing_data=has_existing,
+                ), headers=csrf_headers)
+                return
+
+            if path == "/setup":
+                dest = "/" if self.is_authenticated() else "/login"
+                self.respond(303, "", headers={"Location": dest})
+                return
+
+            if path == "/login":
+                if self.is_authenticated():
+                    self.respond(303, "", headers={"Location": _safe_next(query.get("next", "/"))})
+                    return
+                _, csrf_token, csrf_headers = self.pre_auth_csrf()
+                self.respond(200, login_html(csrf_token, next_url=query.get("next", "/")), headers=csrf_headers)
+                return
+
+            if not self.is_authenticated():
+                if path == "/backup/status":
+                    self.respond(401, json.dumps({"error": "unauthorized"}), "application/json; charset=utf-8")
+                    return
+                next_dest = _safe_next(self.path)
+                login_loc = with_query("/login", {"next": next_dest}) if next_dest != "/" else "/login"
+                self.respond(303, "", headers={"Location": login_loc})
+                return
+
+            if path == "/backup.js":
+                self.respond(200, backup_script, "text/javascript; charset=utf-8")
                 return
             if path == "/backup/status":
                 scheduler, current_settings, active, last = archive.backup_dashboard()
@@ -1381,6 +1862,12 @@ def serve(archive: Archive, host: str, port: int) -> None:
                 if query.get("logs") == "1":
                     status["log"] = recent_backup_log(archive)
                 self.respond(200, json.dumps(status, ensure_ascii=False), "application/json; charset=utf-8")
+                return
+            if path == "/account":
+                reader, headers = self.reader_context()
+                creds = archive.ao3_credentials_status()
+                self.respond(200, account_html(archive, reader, creds_status=creds, notice=query.get("saved", "")),
+                             headers=headers)
                 return
             view, sort = query.get("view", ""), query.get("sort", "")
             q = query.get("q", "")[:200].strip()
@@ -1467,9 +1954,31 @@ def serve(archive: Archive, host: str, port: int) -> None:
             target = urlsplit(self.path)
             match = re.fullmatch(r"/works/([0-9]+)/read", target.path)
             length = positive_id(self.headers.get("Content-Length", ""))
-            if not (match or target.path in {"/backup", "/overview/seen"}) or not 0 < length <= 2048:
+            allowed_paths = {"/setup", "/login", "/logout", "/account", "/backup", "/overview/seen"}
+            if not (match or target.path in allowed_paths) or not 0 < length <= 4096:
                 self.respond(400, "请求无效", "text/plain; charset=utf-8")
                 return
+            try:
+                fields = parse_qs(self.rfile.read(length).decode("utf-8", "replace"),
+                                  keep_blank_values=True, max_num_fields=48)
+            except ValueError:
+                self.respond(400, "请求无效", "text/plain; charset=utf-8")
+                return
+            flat_fields = {key: values[0] for key, values in fields.items()}
+
+            if target.path == "/setup":
+                self.post_setup(fields)
+                return
+            if target.path == "/login":
+                self.post_login(flat_fields)
+                return
+            if not archive.has_web_auth():
+                self.respond(303, "", headers={"Location": "/setup"})
+                return
+            if not self.is_authenticated():
+                self.respond(303, "", headers={"Location": "/login"})
+                return
+
             rid = self.cookie()
             if not rid:
                 self.respond(400, page("需要会话 Cookie", (
@@ -1478,13 +1987,17 @@ def serve(archive: Archive, host: str, port: int) -> None:
                     '<p><a class="button" href="/">返回总览</a></p>'
                 )))
                 return
-            try:
-                fields = parse_qs(self.rfile.read(length).decode("ascii", "replace"),
-                                  keep_blank_values=True, max_num_fields=32)
-            except ValueError:
-                self.respond(400, "请求无效", "text/plain; charset=utf-8")
+
+            if target.path == "/logout":
+                token = flat_fields.get("proof", "")
+                if not re.fullmatch("[0-9a-f]{64}", token) or not hmac.compare_digest(token, backup_proof(rid)):
+                    self.respond(403, "请求来源验证失败", "text/plain; charset=utf-8")
+                    return
+                self.respond(303, "", headers={**self.clear_session_headers(), "Location": "/login"})
                 return
-            flat_fields = {key: values[0] for key, values in fields.items()}
+            if target.path == "/account":
+                self.post_account(rid, flat_fields)
+                return
             if target.path == "/backup":
                 self.post_backup(rid, target.query, fields)
                 return
@@ -1508,6 +2021,148 @@ def serve(archive: Archive, host: str, port: int) -> None:
             except sqlite3.Error:
                 LOG.exception("记录已读状态失败")
                 self.respond(503, "暂时无法记录已读状态", "text/plain; charset=utf-8")
+
+        def post_setup(self, fields: dict[str, list[str]]) -> None:
+            if archive.has_web_auth():
+                self.respond(303, "", headers={"Location": "/"})
+                return
+            proof_val = _field_first(fields, "proof", "")
+            if not self.verify_pre_auth_csrf(proof_val):
+                _, csrf_token, csrf_headers = self.pre_auth_csrf()
+                self.respond(403, setup_html(csrf_token, error="页面表单已过期，请重新提交"), headers=csrf_headers)
+                return
+
+            setup_token = _field_first(fields, "setup_token", "").strip()
+            web_pw = _field_first(fields, "web_password", "")
+            web_pw_confirm = _field_first(fields, "web_password_confirm", "")
+            b_user = _field_first(fields, "bookmark_user", "").strip()
+            a_mode = _field_first(fields, "ao3_auth_mode", "public").strip()
+            a_user = _field_first(fields, "ao3_user", "").strip()
+            a_pw = _field_first(fields, "ao3_password", "")
+            selected_formats = tuple(dict.fromkeys(
+                f.strip().lower() for f in _field_many(fields, "formats")
+                if f.strip().lower() in DOWNLOAD_FORMATS
+            ))
+            _, cur_settings, _, _ = archive.backup_dashboard()
+
+            def _fail(msg: str) -> None:
+                _, csrf_token, csrf_headers = self.pre_auth_csrf()
+                has_existing = bool(_initial_bookmark_user(archive, cur_settings) or archive.has_works())
+                self.respond(400, setup_html(
+                    csrf_token, bookmark_user=b_user, auth_mode=a_mode if a_mode in AO3_AUTH_MODES else "public",
+                    ao3_user=a_user, formats=set(selected_formats), has_existing_data=has_existing, error=msg,
+                ), headers=csrf_headers)
+
+            if not archive.verify_setup_token(setup_token):
+                _fail("初始化口令不正确，请从容器启动日志查看最新 [SETUP] 口令")
+                return
+            if len(web_pw) < 6:
+                _fail("网页访问密码至少需要 6 个字符")
+                return
+            if web_pw != web_pw_confirm:
+                _fail("两次输入的网页访问密码不一致")
+                return
+            if not b_user:
+                _fail("请填写目标书签用户名（BOOKMARK_USER）")
+                return
+            if a_mode not in AO3_AUTH_MODES:
+                _fail("请选择有效的 AO3 登录方式")
+                return
+            if a_mode in ("encrypted", "cookie") and (not a_user or not a_pw):
+                _fail("使用登录模式时请填写 AO3 用户名和密码")
+                return
+            try:
+                if a_mode == "cookie":
+                    login_checker(
+                        archive.root, a_user, a_pw,
+                        timeout=cur_settings.timeout, prefer_v4=cur_settings.prefer_ipv4,
+                    )
+                base_settings = archive.backup_settings() or cur_settings
+                updated_settings = replace(
+                    base_settings, bookmark_user=b_user, formats=selected_formats, formats_configured=True,
+                )
+                archive.set_ao3_credentials(a_mode, a_user, a_pw, clear_cookie_file=(a_mode == "public"))
+                archive.set_backup_settings(updated_settings)
+                session_token = archive.setup_web_auth(web_pw)
+            except (ValueError, RuntimeError) as exc:
+                _fail(str(exc))
+                return
+            except sqlite3.Error:
+                LOG.exception("保存初始化配置失败")
+                self.respond(503, "暂时无法保存初始化配置", "text/plain; charset=utf-8")
+                return
+
+            _, reader_headers = self.reader_context()
+            resp_headers = [("Location", "/"), ("Set-Cookie", self.session_headers(session_token)["Set-Cookie"])]
+            if "Set-Cookie" in reader_headers:
+                resp_headers.append(("Set-Cookie", reader_headers["Set-Cookie"]))
+            self.respond(303, "", headers=resp_headers)
+
+        def post_login(self, fields: dict[str, str]) -> None:
+            next_url = _safe_next(fields.get("next", "/"))
+            if not self.verify_pre_auth_csrf(fields.get("proof", "")):
+                _, csrf_token, csrf_headers = self.pre_auth_csrf()
+                self.respond(403, login_html(csrf_token, next_url=next_url, error="页面表单已过期，请刷新重试"), headers=csrf_headers)
+                return
+            if not archive.verify_web_password(fields.get("password", "")):
+                _, csrf_token, csrf_headers = self.pre_auth_csrf()
+                self.respond(401, login_html(csrf_token, next_url=next_url, error="站点访问密码不正确"), headers=csrf_headers)
+                return
+            token = archive.issue_session_token()
+            _, reader_headers = self.reader_context()
+            resp_headers = [("Location", next_url), ("Set-Cookie", self.session_headers(token)["Set-Cookie"])]
+            if "Set-Cookie" in reader_headers:
+                resp_headers.append(("Set-Cookie", reader_headers["Set-Cookie"]))
+            self.respond(303, "", headers=resp_headers)
+
+        def post_account(self, rid: str, fields: dict[str, str]) -> None:
+            token = fields.get("proof", "")
+            if not re.fullmatch("[0-9a-f]{64}", token) or not hmac.compare_digest(token, backup_proof(rid)):
+                self.respond(403, "请从账号安全页提交修改", "text/plain; charset=utf-8")
+                return
+            reader, _ = archive.reader(rid, visit=False)
+            creds_status = archive.ao3_credentials_status()
+            action = fields.get("action", "")
+            try:
+                if action == "credentials":
+                    a_mode = fields.get("ao3_auth_mode", "").strip()
+                    a_user = fields.get("ao3_user", "").strip()
+                    a_pw = fields.get("ao3_password", "")
+                    if a_mode not in AO3_AUTH_MODES:
+                        raise ValueError("请选择有效的 AO3 登录方式")
+                    if a_mode == "cookie":
+                        if not a_user or not a_pw:
+                            raise ValueError("切换到仅 Cookie 模式需要填写用户名和密码以完成一次在线登录")
+                        _, cur_settings, _, _ = archive.backup_dashboard()
+                        login_checker(
+                            archive.root, a_user, a_pw,
+                            timeout=cur_settings.timeout, prefer_v4=cur_settings.prefer_ipv4,
+                        )
+                    elif a_mode == "encrypted":
+                        user_changed = bool(creds_status["user"] and a_user != creds_status["user"])
+                        if user_changed and not a_pw:
+                            raise ValueError("修改 AO3 用户名时请同时重新输入密码")
+                    archive.set_ao3_credentials(a_mode, a_user, a_pw, clear_cookie_file=(a_mode == "public"))
+                    self.respond(303, "", headers={"Location": "/account?saved=credentials"})
+                    return
+                if action == "password":
+                    cur_pw = fields.get("current_password", "")
+                    new_pw = fields.get("new_password", "")
+                    confirm_pw = fields.get("confirm_password", "")
+                    if new_pw != confirm_pw:
+                        raise ValueError("两次输入的新访问密码不一致")
+                    new_session = archive.change_web_password(cur_pw, new_pw)
+                    self.respond(303, "", headers={**self.session_headers(new_session), "Location": "/account?saved=password"})
+                    return
+                raise ValueError("无效的账户操作")
+            except (ValueError, RuntimeError) as exc:
+                self.respond(400, account_html(
+                    archive, reader, creds_status=creds_status, error=str(exc),
+                    auth_mode=fields.get("ao3_auth_mode", ""), ao3_user=fields.get("ao3_user", ""),
+                ))
+            except sqlite3.Error:
+                LOG.exception("保存账户设置失败")
+                self.respond(503, "暂时无法保存账户设置", "text/plain; charset=utf-8")
 
         def _overview_back(self, query: str) -> dict[str, str]:
             return {key: values[0] for key, values in parse_qs(query).items()
@@ -1539,7 +2194,8 @@ def serve(archive: Archive, host: str, port: int) -> None:
             try:
                 action = _field_first(fields, "action", "")
                 if action == "settings":
-                    archive.set_backup_settings(submitted_settings(fields))
+                    base_settings = archive.backup_settings() or archive.backup_dashboard()[1]
+                    archive.set_backup_settings(submitted_settings(fields, base=base_settings))
                     notice = "saved"
                 else:
                     notice = "queued" if archive.queue_backup(action) else "pending"
@@ -1563,6 +2219,8 @@ def serve(archive: Archive, host: str, port: int) -> None:
             self.respond(303, "", headers={"Location": with_query("/", {**back, "backup": notice}) + "#backup"})
 
     with ThreadingHTTPServer((host, port), Handler) as server:
+        if on_bind is not None:
+            on_bind(server)
         print(f"归档总览已启动 http://{host}:{server.server_port}/", flush=True)
         try:
             server.serve_forever()

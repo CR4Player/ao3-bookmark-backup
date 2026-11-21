@@ -1,6 +1,15 @@
 # AO3 书签备份器
 
-定期备份 AO3 书签中的单篇作品。SQLite 保存作品资料、章节正文、作者附注、历史版本和阅读进度，也可选存 AO3 官方附件。Web 总览提供搜索、阅读、版本比较及 Markdown、JSON 导出。只需要 Python 标准库，支持 Docker。
+定期备份 AO3 书签中的单篇作品。SQLite 保存作品资料、章节正文、作者附注、历史版本和阅读进度，也可选存 AO3 官方附件。Web 总览提供全站访问鉴权、搜索、阅读、版本比较及 Markdown、JSON 导出，支持 Docker 开箱部署。
+
+## 全站鉴权与账号安全
+
+- **首次初始化向导（`/setup`）**：容器首次启动后访问网页会自动进入初始化向导，使用容器日志中输出的 `[SETUP]` 一次性初始化口令设置**全站访问密码**、目标书签用户名（`BOOKMARK_USER`）与官方附件格式，`.env` 无需填写任何明文账号密码。
+- **全站访问保护（`/login`）**：总览、作品阅读、差异对比、设置与导出接口均受会话 Cookie（`HttpOnly` + `SameSite=Strict` + HMAC 签名）保护。若忘记网页密码，可执行 `docker compose exec ao3-web python /app/ao3_backup.py --reset-web-auth` 重新生成初始化口令。
+- **两种 AO3 凭据存储方式（`/account`）**：
+  1. **加密保存密码**：通过 `cryptography.fernet` 与独立密钥文件（`/data/.credentials.key` 或环境变量 `AO3_MASTER_KEY`）加密存储，数据库快照不含明文，且支持 Cookie 失效后自动重登。
+  2. **仅登录保存 Cookie（推荐高敏场景）**：在网页端填写一次密码联网换取 Session 写入 `cookies.txt` 后立即丢弃密码，**密码零落盘**；当 Cookie 过期时页面会自动告警并引导重登。
+  3. 也可保持**仅公开书签**模式不登录 AO3。
 
 ## 总览与版本比较
 
@@ -18,23 +27,29 @@
 
 - **立即刷新**立即排队执行一次书签扫描，发现新增收藏、更新和需要补齐的作品。
 - **重试失败或缺失项**按作品 ID 补抓归档里已有问题的作品。手动补抓允许再尝试已达连续失败上限的作品。
-- **抓取设置**支持五种调度模式：**按固定间隔**（分钟 / 小时 / 天，可选对齐基准时刻不漂移或每次结束后顺延）、**每天**、**每周**（多选星期）、**每月**（1~31 日，遇小月自动在月末执行）以及**仅手动（关闭自动定时）**，并实时预览接下来 3 次执行时间；同时可调整请求间隔、尝试次数和连续失败上限。第一次使用时显示备份进程的环境配置，网页保存后将设置存入 SQLite，调度器在空闲时重新计算计划。
+- **抓取设置**统一接管**目标书签用户名**、**官方附件下载格式**、**五种调度模式**（按固定间隔并支持基准对齐防漂移、每天、每周、每月、仅手动）+ 未来 3 次计划实时预览，以及请求间隔、重试次数、连续失败上限和高级抓取策略（启动立即抓取、最大翻页数、无更新提前停止、请求超时、优先 IPv4）。保存后存入 SQLite 并在调度器空闲时自动生效。
 - **运行日志**显示备份进程输出的最近日志，抓取管理区会自动显示排队状态、上次运行结果和下次计划。点击「更新列表」查看本轮入库的作品。
 
-总览的抓取操作由常驻备份进程领取。使用 Docker 时请同时运行 `ao3-backup` 和 `ao3-web`。局域网内能访问总览的设备也能提交抓取操作和更改抓取设置。
+总览的抓取操作由常驻备份进程领取。使用 Docker 时请同时运行 `ao3-backup` 和 `ao3-web`。
 
 ## Docker 启动
 
 默认直接拉取 GitHub Container Registry 预构建的多架构镜像（支持 `linux/amd64` 与 `linux/arm64`）：`ghcr.io/cr4player/ao3-bookmark-backup:latest`。
 
-在宿主机项目目录创建 `.env`，至少填 `BOOKMARK_USER`，然后运行：
+在宿主机项目目录创建 `.env`（复制 `.env.example`，按需配置网络端口、代理与时区，无需填写明文账号密码），然后运行：
 
 ~~~sh
 docker compose pull
 docker compose up -d
 ~~~
 
-默认从 Docker 宿主机的 `http://127.0.0.1:8765/` 打开总览。备份进程与 Web 进程共享名为 `archive` 的 Compose 持久卷。SQLite 文件和事务日志应位于同一台宿主机的本地文件系统。NAS 可以用本机卷，运行中的库需要避开从其他机器映射的 SMB/NFS 路径。
+首次启动后查看容器日志获取 `[SETUP]` 初始化口令：
+
+~~~sh
+docker compose logs ao3-web
+~~~
+
+默认从 Docker 宿主机的 `http://127.0.0.1:8765/` 打开网页并完成 `/setup` 初始化。备份进程与 Web 进程共享名为 `archive` 的 Compose 持久卷。SQLite 文件和事务日志应位于同一台宿主机的本地文件系统。NAS 可以用本机卷，运行中的库需要避开从其他机器映射的 SMB/NFS 路径。
 
 在局域网内直接访问时，把 NAS 的局域网 IPv4 地址填入 `.env` 的 `WEB_BIND_IP`，例如 `WEB_BIND_IP=192.168.0.3`。在现有项目的目录中运行 `docker compose up -d --no-deps ao3-web` 应用端口配置。如果部署时用过 `-p`，沿用同一个项目名。然后打开 `http://192.168.0.3:8765/`。若用主机名访问，把该主机名加到 `WEB_ALLOWED_HOSTS`。HTTP 直连时使用 `WEB_COOKIE_SECURE=0`，让浏览器保留阅读状态。连得上该端口的设备可以直接读取归档。
 
@@ -104,6 +119,7 @@ docker compose -p ao3-sqlite cp ao3-backup:/data/archive-snapshot.sqlite3 \
 ## 本地运行
 
 ~~~sh
+pip install -r requirements.txt
 python ao3_backup.py --once --bookmark-user YOUR_USERNAME --out ./data-sqlite
 python ao3_backup.py --serve --out ./data-sqlite
 ~~~
@@ -114,29 +130,23 @@ python ao3_backup.py --serve --out ./data-sqlite
 
 抓取器根据书签页的作品 ID、更新时间和作品资料判断哪些作品需要核对，随后从 AO3 全文页提取标题、作者、分级、标签、简介、已发布章节及作品和章节的作者附注。校验章节是否齐全后，将文章、附件和变更记录写入同一笔 SQLite 事务。遇到需要登录、尚未公开的 Mystery Work 或正文不完整时，保留上次成功的归档并记录失败。AO3 账号隐藏警告或附加标签时，完整正文仍会入库。比较版本时会跳过隐藏的字段，并在可用时显示之前采集的标签。
 
-`FORMATS=none` 只抓取和保存文章数据，旧备份中的附件仍可打开。选择 `html,epub` 等格式时，官方附件另外保存。变更比较以结构化文章为准，附件字节变化只标记为「备份文件变化」，同步个人书签备注也不会产生作品更新。正文中的图片会保留原地址和替代文字，图片文件由站点提供。
+默认仅抓取和保存文章数据，旧备份中的附件仍可打开。在网页设置勾选 `html`、`epub` 等格式时，官方附件另外保存。变更比较以结构化文章为准，附件字节变化只标记为「备份文件变化」，同步个人书签备注也不会产生作品更新。正文中的图片会保留原地址和替代文字，图片文件由站点提供。
 
 若 AO3 修改正文或附注时未更新书签页的作品资料或时间戳，可在本地运行 `python ao3_backup.py --once --refresh-content --out <数据目录>`，或在容器里运行 `docker compose exec ao3-backup python /app/ao3_backup.py --once --refresh-content`，主动核对所有扫描到的作品全文。
 
-## 配置
+## 环境变量配置
+
+书签用户、AO3 登录凭据、抓取调度、附件格式与策略参数已全部迁入网页端管理（存量部署的 `.env` 旧变量仍可作为初始化前兜底）。`.env` 仅需关注部署与基础设施项：
 
 | 变量 | 默认 | 用途 |
 | --- | --- | --- |
-| `BOOKMARK_USER` | 必填 | 要备份的 AO3 书签所属用户名 |
-| `AO3_USER` / `AO3_PASSWORD` | 空 | 登录后访问私有书签及受限作品 |
-| `RUN_AT` | `03:30` | 容器时区的每日运行时刻 |
-| `INTERVAL` | 空 | 可设为 `6h` 等固定间隔，优先于 `RUN_AT` |
-| `RUN_ON_START` | `1` | 启动即运行 |
-| `DELAY` / `TIMEOUT` / `RETRIES` | `1.5` / `60` / `4` | 请求间隔、超时秒数、总尝试次数（含首次） |
-| `PREFER_IPV4` | `1` | 优先 IPv4 |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 空 | 可选 HTTP 代理，比如 `http://host.docker.internal:7890` |
-| `MAX_PAGES` / `MAX_ERRORS` | `200` / `5` | 翻页限制及连续失败暂停阈值 |
-| `STOP_AFTER_IDLE_PAGES` | `0` | 非零时可提前结束无变化的扫描并按作品更新时间补扫 |
-| `FORMATS` | `none` | 设为 `none` 只保存文章数据，也可填写以逗号分隔的 `html,epub,pdf,mobi,azw3`。旧文件模式默认 `html` |
-| `KEEP_VERSIONS` | `1` | 旧版文件模式的历史归档开关 |
-| `HEALTHCHECK_MAX_AGE_HOURS` | `48` | 距上次完整成功运行的健康检查上限 |
 | `WEB_BIND_IP` | `127.0.0.1` | Compose 在宿主机上绑定的 IPv4 地址，直连时填 NAS 局域网 IP |
 | `WEB_PORT` | `8765` | Compose 发布到宿主机的端口 |
+| `WEB_ALLOWED_HOSTS` | 空 | 局域网主机名或反向代理域名白名单（逗号分隔） |
+| `WEB_COOKIE_SECURE` | `0` | HTTP 直连设 `0`；经 HTTPS 反向代理访问设为 `1` |
 | `TZ` | `Asia/Shanghai` | 容器时区 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 空 | 可选 HTTP 代理，例如 `http://host.docker.internal:7890` |
+| `HEALTHCHECK_MAX_AGE_HOURS` | `48` | 距上次完整成功运行的健康检查上限 |
+| `AO3_MASTER_KEY` | 空 | 可选：指定自定义加密主密钥（留空则自动生成于 `/data/.credentials.key`） |
 
-AO3 站点提供的私有或受限内容随登录权限读取。请勿将 `.env`、登录 Cookie 或个人书签归档上传到公共仓库。项目与 OTW / AO3 官方无关。
+AO3 站点提供的私有或受限内容随登录权限读取。请勿将 `.env`、`.credentials.key`、`cookies.txt` 或个人书签归档上传到公共仓库。项目与 OTW / AO3 官方无关。

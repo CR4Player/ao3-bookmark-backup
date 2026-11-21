@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import calendar
 import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 import time
@@ -146,6 +149,65 @@ INTERVAL_UNITS = ("minute", "hour", "day")
 ANCHOR_MODES = ("fixed", "after")
 UNIT_SECONDS = {"minute": 60, "hour": 3600, "day": 86400}
 WEEKDAY_LABELS = ("一", "二", "三", "四", "五", "六", "日")
+AO3_AUTH_MODES = ("public", "encrypted", "cookie")
+SETUP_TOKEN_FILE = ".setup_token"
+CREDENTIAL_KEY_FILE = ".credentials.key"
+SETUP_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+PBKDF2_ITERATIONS = 200_000
+
+
+def _fernet_class():
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as exc:
+        raise RuntimeError("缺少 cryptography 依赖，请执行 pip install -r requirements.txt") from exc
+    return Fernet
+
+
+def _open_private_exclusive(path: Path, content: str) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(str(path), flags, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return True
+
+
+def _credential_fernet(root: Path, *, create: bool = False):
+    Fernet = _fernet_class()
+    master = os.environ.get("AO3_MASTER_KEY", "").strip()
+    if master:
+        derived = base64.urlsafe_b64encode(hashlib.sha256(master.encode("utf-8")).digest())
+        return Fernet(derived)
+    key_path = root / CREDENTIAL_KEY_FILE
+    if not key_path.exists():
+        if not create:
+            return None
+        key_bytes = Fernet.generate_key().decode("ascii")
+        _open_private_exclusive(key_path, key_bytes + "\n")
+    raw = key_path.read_text(encoding="ascii").strip()
+    try:
+        return Fernet(raw.encode("ascii"))
+    except ValueError as exc:
+        raise RuntimeError("凭据密钥文件格式无效（.credentials.key）") from exc
+
+
+def _hash_password(password: str, salt: bytes | None = None) -> tuple[str, str]:
+    raw_salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), raw_salt, PBKDF2_ITERATIONS)
+    return raw_salt.hex(), digest.hex()
 
 
 @dataclass(frozen=True)
@@ -161,6 +223,14 @@ class BackupSettings:
     anchor_mode: str = "fixed"
     weekdays: tuple[int, ...] = (6,)
     month_day: int = 1
+    bookmark_user: str = ""
+    formats: tuple[str, ...] = ()
+    formats_configured: bool = False
+    run_on_start: bool = True
+    stop_after_idle_pages: int = 0
+    max_pages: int = 200
+    timeout: int = 60
+    prefer_ipv4: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> BackupSettings:
@@ -185,6 +255,35 @@ class BackupSettings:
                 cleaned["month_day"] = min(31, max(1, int(cleaned["month_day"])))
             except (TypeError, ValueError):
                 cleaned["month_day"] = 1
+        if "formats" in cleaned:
+            raw_formats = cleaned["formats"]
+            if isinstance(raw_formats, (list, tuple)):
+                cleaned["formats"] = tuple(dict.fromkeys(
+                    str(f).strip().lower() for f in raw_formats
+                    if str(f).strip().lower() in DOWNLOAD_FORMATS
+                ))
+            else:
+                cleaned["formats"] = ()
+        if "bookmark_user" in cleaned:
+            cleaned["bookmark_user"] = str(cleaned["bookmark_user"] or "").strip()
+        if "stop_after_idle_pages" in cleaned:
+            try:
+                cleaned["stop_after_idle_pages"] = max(0, int(cleaned["stop_after_idle_pages"]))
+            except (TypeError, ValueError):
+                cleaned["stop_after_idle_pages"] = 0
+        if "max_pages" in cleaned:
+            try:
+                cleaned["max_pages"] = min(5000, max(1, int(cleaned["max_pages"])))
+            except (TypeError, ValueError):
+                cleaned["max_pages"] = 200
+        if "timeout" in cleaned:
+            try:
+                cleaned["timeout"] = min(600, max(5, int(cleaned["timeout"])))
+            except (TypeError, ValueError):
+                cleaned["timeout"] = 60
+        for flag in ("formats_configured", "run_on_start", "prefer_ipv4"):
+            if flag in cleaned:
+                cleaned[flag] = bool(cleaned[flag])
         return cls(**cleaned)
 
 
@@ -360,6 +459,10 @@ class Archive:
     def __init__(self, directory: Path) -> None:
         self.path = directory / DATABASE_NAME
 
+    @property
+    def root(self) -> Path:
+        return self.path.parent
+
     @contextmanager
     def connect(self, *, readonly: bool = False):
         path = self.path.resolve()
@@ -524,10 +627,224 @@ class Archive:
         with self.write() as db:
             db.execute("INSERT OR IGNORE INTO settings VALUES ('bookmark_user', ?)", (user,))
 
+    def stored_bookmark_user(self) -> str:
+        with self.connect(readonly=True) as db:
+            row = db.execute("SELECT value FROM settings WHERE key='bookmark_user'").fetchone()
+            return str(row[0]).strip() if row and row[0] else ""
+
+    def has_works(self) -> bool:
+        with self.connect(readonly=True) as db:
+            return db.execute("SELECT 1 FROM works LIMIT 1").fetchone() is not None
+
     @staticmethod
     def _setting(db: sqlite3.Connection, key: str) -> Any:
         row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def has_web_auth(self) -> bool:
+        with self.connect(readonly=True) as db:
+            auth = self._setting(db, "web_auth")
+            return bool(auth and auth.get("hash") and auth.get("salt") and auth.get("session_secret"))
+
+    def ensure_setup_token(self) -> str:
+        if self.has_web_auth():
+            return ""
+        token_path = self.root / SETUP_TOKEN_FILE
+        if not token_path.exists():
+            raw = "".join(secrets.choice(SETUP_ALPHABET) for _ in range(12))
+            formatted = f"{raw[:4]}-{raw[4:8]}-{raw[8:12]}"
+            _open_private_exclusive(token_path, formatted + "\n")
+        return token_path.read_text(encoding="utf-8").strip()
+
+    def verify_setup_token(self, token: str) -> bool:
+        if self.has_web_auth():
+            return False
+        token_path = self.root / SETUP_TOKEN_FILE
+        if not token_path.exists():
+            return False
+        expected = re.sub(r"[\s-]+", "", token_path.read_text(encoding="utf-8").upper())
+        supplied = re.sub(r"[\s-]+", "", (token or "").upper())
+        return bool(expected) and hmac.compare_digest(expected, supplied)
+
+    def setup_web_auth(self, password: str) -> str:
+        if len(password) < 6:
+            raise ValueError("网页访问密码至少需要 6 个字符")
+        if self.has_web_auth():
+            raise ValueError("网页访问密码已初始化")
+        salt_hex, digest_hex = _hash_password(password)
+        auth = {
+            "salt": salt_hex,
+            "hash": digest_hex,
+            "session_secret": secrets.token_hex(32),
+            "auth_version": 1,
+            "updated_at": timestamp(),
+        }
+        with self.write() as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('web_auth', ?)", (encode(auth),))
+        (self.root / SETUP_TOKEN_FILE).unlink(missing_ok=True)
+        return self._sign_session(auth)
+
+    def reset_web_auth(self) -> str:
+        with self.write() as db:
+            db.execute("DELETE FROM settings WHERE key='web_auth'")
+        (self.root / SETUP_TOKEN_FILE).unlink(missing_ok=True)
+        return self.ensure_setup_token()
+
+    def verify_web_password(self, password: str) -> bool:
+        with self.connect(readonly=True) as db:
+            auth = self._setting(db, "web_auth")
+        if not auth or not password:
+            return False
+        try:
+            salt = bytes.fromhex(auth["salt"])
+            expected = auth["hash"]
+        except (KeyError, ValueError):
+            return False
+        _, actual = _hash_password(password, salt)
+        return hmac.compare_digest(actual, expected)
+
+    def change_web_password(self, current_password: str, new_password: str) -> str:
+        if not self.verify_web_password(current_password):
+            raise ValueError("当前访问密码不正确")
+        if len(new_password) < 6:
+            raise ValueError("新访问密码至少需要 6 个字符")
+        with self.connect(readonly=True) as db:
+            prev = self._setting(db, "web_auth") or {}
+        salt_hex, digest_hex = _hash_password(new_password)
+        auth = {
+            "salt": salt_hex,
+            "hash": digest_hex,
+            "session_secret": secrets.token_hex(32),
+            "auth_version": int(prev.get("auth_version", 1)) + 1,
+            "updated_at": timestamp(),
+        }
+        with self.write() as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('web_auth', ?)", (encode(auth),))
+        return self._sign_session(auth)
+
+    @staticmethod
+    def _sign_session(auth: dict[str, Any], days: int = 30) -> str:
+        expires = int(time.time()) + days * 86400
+        version = int(auth.get("auth_version", 1))
+        payload = f"{version}:{expires}"
+        sig = hmac.new(bytes.fromhex(auth["session_secret"]), payload.encode("ascii"), "sha256").hexdigest()
+        return f"{version}.{expires}.{sig}"
+
+    def issue_session_token(self, days: int = 30) -> str:
+        with self.connect(readonly=True) as db:
+            auth = self._setting(db, "web_auth")
+        if not auth:
+            return ""
+        return self._sign_session(auth, days=days)
+
+    def verify_session_token(self, token: str) -> bool:
+        parts = (token or "").split(".")
+        if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            return False
+        version, expires, sig = int(parts[0]), int(parts[1]), parts[2]
+        if expires < int(time.time()) or not re.fullmatch(r"[0-9a-f]{64}", sig):
+            return False
+        with self.connect(readonly=True) as db:
+            auth = self._setting(db, "web_auth")
+        if not auth or version != int(auth.get("auth_version", 1)):
+            return False
+        payload = f"{version}:{expires}"
+        expected = hmac.new(bytes.fromhex(auth["session_secret"]), payload.encode("ascii"), "sha256").hexdigest()
+        return hmac.compare_digest(sig, expected)
+
+    def ao3_credentials_status(self) -> dict[str, Any]:
+        with self.connect(readonly=True) as db:
+            raw = self._setting(db, "ao3_credentials")
+        if not raw:
+            return {
+                "configured": False, "auth_mode": "", "user": "", "has_password": False,
+                "updated_at": "", "cookie_saved_at": "", "cookie_expired": False,
+            }
+        mode = raw.get("auth_mode") if raw.get("auth_mode") in AO3_AUTH_MODES else "public"
+        return {
+            "configured": True,
+            "auth_mode": mode,
+            "user": str(raw.get("user") or ""),
+            "has_password": bool(raw.get("password_enc")),
+            "updated_at": str(raw.get("updated_at") or ""),
+            "cookie_saved_at": str(raw.get("cookie_saved_at") or ""),
+            "cookie_expired": bool(raw.get("cookie_expired", False)),
+        }
+
+    def decrypted_ao3_credentials(self) -> tuple[str, str, str]:
+        with self.connect(readonly=True) as db:
+            raw = self._setting(db, "ao3_credentials")
+        if not raw:
+            return "", "", ""
+        mode = raw.get("auth_mode") if raw.get("auth_mode") in AO3_AUTH_MODES else "public"
+        user = str(raw.get("user") or "").strip()
+        if mode == "public":
+            return "public", "", ""
+        if mode == "cookie":
+            return "cookie", user, ""
+        token = str(raw.get("password_enc") or "")
+        if not token:
+            return "encrypted", user, ""
+        fernet = _credential_fernet(self.root, create=False)
+        if fernet is None:
+            raise RuntimeError("找不到凭据密钥文件 .credentials.key，无法解密 AO3 密码")
+        from cryptography.fernet import InvalidToken
+
+        try:
+            plain = fernet.decrypt(token.encode("ascii")).decode("utf-8")
+        except InvalidToken as exc:
+            raise RuntimeError("AO3 凭据解密失败，请检查 .credentials.key 或 AO3_MASTER_KEY") from exc
+        return "encrypted", user, plain
+
+    def set_ao3_credentials(
+        self, auth_mode: str, user: str = "", password: str = "", *, clear_cookie_file: bool = False,
+    ) -> None:
+        if auth_mode not in AO3_AUTH_MODES:
+            raise ValueError("不支持的 AO3 认证方式")
+        user = user.strip()
+        if auth_mode == "public":
+            record = {
+                "auth_mode": "public", "user": "", "password_enc": "",
+                "updated_at": timestamp(), "cookie_saved_at": "", "cookie_expired": False,
+            }
+            if clear_cookie_file:
+                (self.root / "cookies.txt").unlink(missing_ok=True)
+        elif auth_mode == "cookie":
+            if not user:
+                raise ValueError("请填写 AO3 用户名")
+            record = {
+                "auth_mode": "cookie", "user": user, "password_enc": "",
+                "updated_at": timestamp(), "cookie_saved_at": timestamp(), "cookie_expired": False,
+            }
+        else:
+            if not user:
+                raise ValueError("请填写 AO3 用户名")
+            with self.connect(readonly=True) as db:
+                prev = self._setting(db, "ao3_credentials") or {}
+            prev_enc = str(prev.get("password_enc") or "") if prev.get("auth_mode") == "encrypted" else ""
+            if password:
+                fernet = _credential_fernet(self.root, create=True)
+                password_enc = fernet.encrypt(password.encode("utf-8")).decode("ascii")
+            elif prev_enc:
+                password_enc = prev_enc
+            else:
+                raise ValueError("首次启用加密保存时请填写 AO3 密码")
+            record = {
+                "auth_mode": "encrypted", "user": user, "password_enc": password_enc,
+                "updated_at": timestamp(), "cookie_saved_at": "", "cookie_expired": False,
+            }
+        with self.write() as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('ao3_credentials', ?)", (encode(record),))
+
+    def mark_ao3_cookie_expired(self, expired: bool) -> None:
+        with self.write() as db:
+            raw = self._setting(db, "ao3_credentials")
+            if not raw or raw.get("auth_mode") != "cookie":
+                return
+            raw["cookie_expired"] = bool(expired)
+            if not expired:
+                raw["cookie_saved_at"] = timestamp()
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('ao3_credentials', ?)", (encode(raw),))
 
     def backup_settings(self) -> BackupSettings | None:
         with self.connect(readonly=True) as db:
@@ -538,10 +855,13 @@ class Archive:
         with self.write() as db:
             db.execute("INSERT OR REPLACE INTO settings VALUES ('backup_settings', ?)", (encode(asdict(settings)),))
 
-    def publish_scheduler(self, defaults: BackupSettings, formats: tuple[str, ...], next_run: int) -> None:
+    def publish_scheduler(
+        self, defaults: BackupSettings, formats: tuple[str, ...], next_run: int,
+        *, awaiting_setup: bool = False,
+    ) -> None:
         with self.write() as db:
             state = {"defaults": asdict(defaults), "formats": formats, "next_run": next_run,
-                     "seen_at": int(time.time())}
+                     "awaiting_setup": awaiting_setup, "seen_at": int(time.time())}
             db.execute("INSERT OR REPLACE INTO settings VALUES ('backup_scheduler', ?)", (encode(state),))
 
     def backup_dashboard(self) -> tuple[dict, BackupSettings, list[dict], dict | None]:

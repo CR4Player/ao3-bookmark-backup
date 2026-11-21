@@ -339,4 +339,47 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     });
   }
+
+  // AO3 auth mode toggle in /setup and /account.
+  for (const scope of document.querySelectorAll('[data-ao3-auth-scope]')) {
+    const radios = Array.from(scope.querySelectorAll('input[name="ao3_auth_mode"]'));
+    const fieldsBox = scope.querySelector('[data-ao3-cred-fields]');
+    const userInput = scope.querySelector('input[name="ao3_user"]');
+    const pwInput = scope.querySelector('input[name="ao3_password"]');
+    const modeHint = scope.querySelector('[data-ao3-mode-hint]');
+    const pwHint = scope.querySelector('[data-ao3-pw-hint]');
+
+    const hints = {
+      public: '不登录 AO3，仅备份目标用户的公开书签和公开作品。',
+      encrypted: '使用独立密钥文件（/data/.credentials.key）加密保存密码，Cookie 失效时可自动重新登录。',
+      cookie: '提交时立即联网登录一次并仅保存 Cookie，密码不写入数据库；Cookie 过期后再回此页重登即可。',
+    };
+
+    const syncAuth = () => {
+      const checked = radios.find(r => r.checked);
+      const mode = checked ? checked.value : 'public';
+      const isPublic = mode === 'public';
+      if (fieldsBox) fieldsBox.hidden = isPublic;
+      if (modeHint) modeHint.textContent = hints[mode] || '';
+      if (userInput) userInput.required = !isPublic;
+      if (pwInput) {
+        const hasSaved = pwInput.dataset.hasSaved === '1';
+        if (mode === 'cookie') {
+          pwInput.placeholder = '输入 AO3 密码用于本次在线登录';
+          pwInput.required = true;
+          if (pwHint) pwHint.textContent = '仅用于即时向 AO3 登录换取 Cookie，不保存密码';
+        } else if (mode === 'encrypted') {
+          pwInput.placeholder = hasSaved ? '已加密保存（留空保持原密码）' : '输入 AO3 登录密码';
+          pwInput.required = !hasSaved;
+          if (pwHint) pwHint.textContent = hasSaved ? '如需更换密码直接输入新密码，留空则沿用已加密密码' : '将通过 Fernet 对称加密存入配置';
+        } else {
+          pwInput.required = false;
+          if (pwHint) pwHint.textContent = '';
+        }
+      }
+    };
+
+    scope.addEventListener('change', syncAuth);
+    syncAuth();
+  }
 });

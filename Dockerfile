@@ -15,6 +15,9 @@ RUN apt-get update \
  && echo "${TZ}" > /etc/timezone
 
 WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY ao3_backup.py ao3_content.py ao3_diff.py ao3_store.py ao3_web.py ao3_web.css ao3_web.js ao3_reader.js /app/
 
 # 非 root 运行；/data 是数据挂载点
