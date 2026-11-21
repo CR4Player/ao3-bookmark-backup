@@ -82,12 +82,13 @@
   --radius-lg: 10px;
   --radius-pill: 9999px;
 
-  /* 排版字体栈与默认阅读尺度（默认宽幅书案 1240px） */
-  --font-sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
-  --font-serif: "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "STSong", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  /* 排版字体栈与默认阅读尺度（全站屏显黑体 + 宽幅书案 1240px + 可选霞鹜文楷屏显版） */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
+  --font-serif: Georgia, "Palatino Linotype", Palatino, "Source Han Serif SC", "Noto Serif CJK SC", "Songti SC", "STSong", serif;
+  --font-wenkai: "LXGW WenKai Screen", "LXGW WenKai GB Screen", "LXGW WenKai", "Kaiti SC", "STKaiti", "KaiTi", serif;
   --font-mono: "JetBrains Mono", "Roboto Mono", Menlo, Consolas, monospace;
   --reader-width: 1240px;
-  --reader-font: var(--font-serif);
+  --reader-font: var(--font-sans);
   --reader-prose-size: clamp(1.06rem, 1.02rem + 0.25vw, 1.16rem);
   --reader-prose-lh: 1.95;
 
@@ -492,8 +493,10 @@
   --shadow-lg: 0 10px 26px rgba(0, 0, 0, 0.65);
 }
 
-/* 阅读字体选项 */
+/* 阅读字体选项（默认现代黑体，可选霞鹜文楷屏显版 / 优雅衬线 / 系统楷体 / 系统默认） */
 :root[data-reader-font="sans"] { --reader-font: var(--font-sans); }
+:root[data-reader-font="wenkai"] { --reader-font: var(--font-wenkai); }
+:root[data-reader-font="serif"] { --reader-font: var(--font-serif); }
 :root[data-reader-font="kaiti"] {
   --reader-font: Georgia, "Kaiti SC", "STKaiti", "KaiTi", "BiauKai", "DFKai-SB", "Noto Serif CJK SC", serif;
 }
@@ -533,8 +536,8 @@ body {
 }
 
 h1, h2, h3, p, ul, ol, dl, dt, dd { margin: 0; }
-h1 { font-family: var(--font-serif); font-size: 1.62rem; font-weight: 700; line-height: 1.3; letter-spacing: 0.01em; color: var(--ink); }
-h2 { font-family: var(--font-serif); font-size: 1.18rem; font-weight: 700; line-height: 1.38; color: var(--ink); }
+h1 { font-family: var(--font-sans); font-size: 1.62rem; font-weight: 700; line-height: 1.3; letter-spacing: 0.01em; color: var(--ink); }
+h2 { font-family: var(--font-sans); font-size: 1.18rem; font-weight: 700; line-height: 1.38; color: var(--ink); }
 h3 { font-size: 0.92rem; font-weight: 600; color: var(--ink-secondary); }
 
 a {
@@ -620,7 +623,7 @@ html.is-theme-switching *::after {
   align-items: center;
   gap: 10px;
   color: var(--ink);
-  font-family: var(--font-serif);
+  font-family: var(--font-sans);
   font-weight: 700;
   font-size: 1.12rem;
   letter-spacing: 0.01em;
@@ -2170,7 +2173,7 @@ input[type=search] {
 .row-title {
   min-width: 0;
   overflow-wrap: anywhere;
-  font-family: var(--font-serif);
+  font-family: var(--font-sans);
   font-size: 1.2rem;
   line-height: 1.32;
   font-weight: 700;
@@ -2789,7 +2792,7 @@ a.page-item:hover {
 }
 
 .work-heading h1 {
-  font-family: var(--font-serif);
+  font-family: var(--font-sans);
   font-size: 1.65rem;
   font-weight: 700;
 }
@@ -3052,7 +3055,7 @@ a.page-item:hover {
 .diff-body p {
   overflow-wrap: anywhere;
   white-space: pre-wrap;
-  font-family: var(--font-serif);
+  font-family: var(--font-sans);
 }
 
 .diff-key, .diff-pair {
@@ -3299,7 +3302,7 @@ a.page-item:hover {
   gap: 7px;
 }
 .side-work-title {
-  font-family: var(--font-serif);
+  font-family: var(--font-sans);
   font-size: 1.05rem;
   font-weight: 700;
   line-height: 1.3;

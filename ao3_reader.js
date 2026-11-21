@@ -6,7 +6,7 @@ const widthKey = 'ao3-reader-width';
 const densityKey = 'ao3-reader-density';
 const sidebarKey = 'ao3-reader-sidebar';
 const themes = ['system', 'day', 'sage', 'lavender', 'sepia', 'crimson', 'night', 'dusk', 'midnight'];
-const fonts = ['serif', 'sans', 'kaiti', 'system'];
+const fonts = ['sans', 'wenkai', 'serif', 'kaiti', 'system'];
 const sizes = ['small', 'medium', 'large', 'xlarge'];
 const widths = ['narrow', 'medium', 'wide'];
 const densities = ['compact', 'cozy'];
@@ -32,7 +32,7 @@ function savePref(key, value) {
 }
 
 let theme = readPref(themeKey, themes, 'system');
-let fontFamily = readPref(fontKey, fonts, 'serif');
+let fontFamily = readPref(fontKey, fonts, 'sans');
 let fontSize = readPref(sizeKey, sizes, 'medium');
 let pageWidth = readPref(widthKey, widths, 'medium');
 let listDensity = readPref(densityKey, densities, 'compact');

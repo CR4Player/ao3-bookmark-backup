@@ -62,7 +62,7 @@ MIMES = {
     "epub": "application/epub+zip", "pdf": "application/pdf",
     "mobi": "application/x-mobipocket-ebook", "azw3": "application/vnd.amazon.ebook",
 }
-PAGE_POLICY = "default-src 'none'; style-src 'self'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+PAGE_POLICY = "default-src 'none'; style-src 'self'; script-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 READER_POLICY = PAGE_POLICY
 DASHBOARD_POLICY = READER_POLICY + "; connect-src 'self'"
 FILE_POLICY = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'; base-uri 'none'"
@@ -222,11 +222,12 @@ def page(
   </div>
 </div>"""
     brand_href = escape(brand if auth_mode == "app" else "#")
+    font_link = '<link rel="stylesheet" href="/fonts/wenkai/style.css">' if reading else ""
     main_cls = "wrap reader-main" if reading else "wrap"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{escape(title)} · AO3 书签备份</title>{script_tags}<link rel="stylesheet" href="/archive.css"></head>
+<title>{escape(title)} · AO3 书签备份</title>{script_tags}{font_link}<link rel="stylesheet" href="/archive.css"></head>
 <body{body_class}><a class="skip" href="#main">跳到内容</a>
 <header class="top"><div class="wrap top-row">
 <div class="brand-group"><a class="brand" href="{brand_href}"><span>AO3</span> 书签备份</a>{nav_links}</div>
@@ -1688,8 +1689,9 @@ def article_html(
       <div class="overline-label">TYPOGRAPHY · 阅读排版</div>
       <div class="reader-prefs">
         <label><span>字体</span><select id="reader-font">
-          <option value="serif">优雅衬线</option><option value="sans">现代黑体</option>
-          <option value="kaiti">温润楷体</option><option value="system">系统默认</option>
+          <option value="sans">现代黑体</option><option value="wenkai">霞鹜文楷（屏显）</option>
+          <option value="serif">优雅衬线</option><option value="kaiti">系统楷体</option>
+          <option value="system">系统默认</option>
         </select></label>
         <label><span>字号</span><select id="reader-size">
           <option value="small">小</option><option value="medium">标准</option>
@@ -1963,6 +1965,9 @@ def serve(
     css = Path(__file__).with_name("ao3_web.css").read_bytes()
     backup_script = Path(__file__).with_name("ao3_web.js").read_bytes()
     reader_script = Path(__file__).with_name("ao3_reader.js").read_bytes()
+    wenkai_dir = Path(__file__).with_name("fonts") / "wenkai"
+    wenkai_files_dir = wenkai_dir / "files"
+    wenkai_css = (wenkai_dir / "style.css").read_bytes() if (wenkai_dir / "style.css").is_file() else b""
     allowed_hosts = {"localhost", "127.0.0.1", "::1"} | {
         item.strip().casefold() for item in os.environ.get("WEB_ALLOWED_HOSTS", "").split(",") if item.strip()
     }
@@ -2218,12 +2223,13 @@ def serve(
             return reader, headers
 
         def respond(self, status: int, body: str | bytes, mime: str = "text/html; charset=utf-8",
-                    headers: dict[str, str] | list[tuple[str, str]] | None = None, *, policy: str = PAGE_POLICY) -> None:
+                    headers: dict[str, str] | list[tuple[str, str]] | None = None, *,
+                    policy: str = PAGE_POLICY, cache_control: str = "private, no-store") -> None:
             raw = body.encode() if isinstance(body, str) else body
             self.send_response(status)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("Cache-Control", cache_control)
             self.send_header("Content-Security-Policy", policy)
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -2260,6 +2266,21 @@ def serve(
                 return
             if path == "/reader.js":
                 self.respond(200, reader_script, "text/javascript; charset=utf-8")
+                return
+            if path == "/fonts/wenkai/style.css":
+                cache = "public, max-age=31536000, immutable" if wenkai_css else "private, no-store"
+                self.respond(200, wenkai_css, "text/css; charset=utf-8", cache_control=cache)
+                return
+            if path.startswith("/fonts/wenkai/files/"):
+                fname = path.removeprefix("/fonts/wenkai/files/")
+                fpath = wenkai_files_dir / fname
+                if re.fullmatch(r"lxgwwenkaigbscreen-subset-\d+\.woff2", fname) and fpath.is_file():
+                    self.respond(
+                        200, fpath.read_bytes(), "font/woff2",
+                        cache_control="public, max-age=31536000, immutable",
+                    )
+                else:
+                    self.respond(404, "找不到字体分片", "text/plain; charset=utf-8")
                 return
 
             has_auth = archive.has_web_auth()

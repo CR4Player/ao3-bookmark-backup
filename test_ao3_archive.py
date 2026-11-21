@@ -546,6 +546,9 @@ class SQLiteArchiveTests(unittest.TestCase):
         self.assertIn("正文阅读", page_html)
         self.assertIn("正在阅读历史存档（第 1 / 2 版）", page_html)
         self.assertIn('id="reader-font"', page_html)
+        self.assertIn('<option value="sans">现代黑体</option>', page_html)
+        self.assertIn('<option value="wenkai">霞鹜文楷（屏显）</option>', page_html)
+        self.assertIn('/fonts/wenkai/style.css', page_html)
         self.assertIn('id="reader-size"', page_html)
         self.assertIn('id="reader-width"', page_html)
         self.assertIn('id="reader-sidebar"', page_html)
@@ -812,6 +815,15 @@ class SQLiteArchiveTests(unittest.TestCase):
 
             status, _, body = fetch(opener, "/health")
             self.assertEqual((status, body), (200, "ok\n"))
+
+            status, font_headers, _ = fetch(opener, "/fonts/wenkai/style.css")
+            self.assertEqual(status, 200)
+            self.assertIn("text/css", font_headers.get("Content-Type", ""))
+            self.assertIn("font-src 'self'", font_headers.get("Content-Security-Policy", ""))
+            status, _, _ = fetch(opener, "/fonts/wenkai/files/bad.woff2")
+            self.assertEqual(status, 404)
+            status, _, _ = fetch(opener, "/fonts/wenkai/files/../../etc/passwd")
+            self.assertEqual(status, 404)
 
             status, headers, _ = fetch(opener, "/")
             self.assertEqual(status, 303)
