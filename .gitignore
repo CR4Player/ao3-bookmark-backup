@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.tmp/
+data/
+testdata*/
+__pycache__/
+*.py[cod]
+*.log
+*.sqlite
+*.sqlite3*
+*.db
+*.zip
+cookies.txt
+.backup.lock
+.running

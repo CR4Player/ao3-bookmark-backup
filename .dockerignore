@@ -1,0 +1,13 @@
+data/
+.tmp/
+testdata*/
+.env
+*.log
+__pycache__/
+*.py[cod]
+.git/
+.github/
+.gitignore
+README.md
+docker-compose.yml
+docs/
