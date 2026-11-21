@@ -36,9 +36,11 @@
 
 默认直接拉取 GitHub Container Registry 预构建的多架构镜像（支持 `linux/amd64` 与 `linux/arm64`）：`ghcr.io/cr4player/ao3-bookmark-backup:latest`。
 
-在宿主机项目目录创建 `.env`（复制 `.env.example`，按需配置网络端口、代理与时区，无需填写明文账号密码），然后运行：
+在宿主机项目目录创建 `.env`（复制 `.env.example`，按需配置网络端口、代理与时区，无需填写明文账号密码）并确保数据目录归属 `uid 1000`，然后启动：
 
 ~~~sh
+mkdir -p ./data
+chown -R 1000:1000 ./data
 docker compose pull
 docker compose up -d
 ~~~
@@ -49,9 +51,9 @@ docker compose up -d
 docker compose logs ao3-web
 ~~~
 
-默认从 Docker 宿主机的 `http://127.0.0.1:8765/` 打开网页并完成 `/setup` 初始化。备份进程与 Web 进程共享名为 `archive` 的 Compose 持久卷。SQLite 文件和事务日志应位于同一台宿主机的本地文件系统。NAS 可以用本机卷，运行中的库需要避开从其他机器映射的 SMB/NFS 路径。
+默认从 Docker 宿主机的 `http://127.0.0.1:8765/` 打开网页并完成 `/setup` 初始化。备份进程与 Web 进程共同绑定挂载宿主机本地目录 `./data:/data`，方便连同项目目录整包备份（NAS 可以直接挂载本机目录，但运行中的 SQLite 库需避开从其他机器远程映射的 SMB/NFS 网络路径）。
 
-在局域网内直接访问时，把 NAS 的局域网 IPv4 地址填入 `.env` 的 `WEB_BIND_IP`，例如 `WEB_BIND_IP=192.168.0.3`。在现有项目的目录中运行 `docker compose up -d --no-deps ao3-web` 应用端口配置。如果部署时用过 `-p`，沿用同一个项目名。然后打开 `http://192.168.0.3:8765/`。若用主机名访问，把该主机名加到 `WEB_ALLOWED_HOSTS`。HTTP 直连时使用 `WEB_COOKIE_SECURE=0`，让浏览器保留阅读状态。连得上该端口的设备可以直接读取归档。
+在局域网内直接访问时，把 NAS 的局域网 IPv4 地址填入 `.env` 的 `WEB_BIND_IP`，例如 `WEB_BIND_IP=192.168.0.3`。在现有项目的目录中运行 `docker compose up -d --no-deps ao3-web` 应用端口配置。如果部署时用过 `-p`，沿用同一个项目名。然后打开 `http://192.168.0.3:8765/`。若用主机名访问，把该主机名加到 `WEB_ALLOWED_HOSTS`。HTTP 直连时使用 `WEB_COOKIE_SECURE=0`，让浏览器保留阅读状态。
 
 保留默认监听地址时，从另一台电脑可用 SSH 转发 `ssh -L 8765:127.0.0.1:8765 用户@群晖地址`，或通过带认证的 HTTPS 反向代理访问。使用反向代理时，在 `.env` 设置 `WEB_ALLOWED_HOSTS` 为访问用域名，设置 `WEB_COOKIE_SECURE=1`，并让代理保留对应的 Host。
 
@@ -61,7 +63,7 @@ docker compose logs -f ao3-backup
 docker compose exec ao3-backup python /app/ao3_backup.py --once --dry-run
 ~~~
 
-修改 `.env` 后，使用 `docker compose up -d` 重新创建配置有变更的容器。普通 `docker compose down` 保留持久卷。
+修改 `.env` 后，使用 `docker compose up -d` 重新创建配置有变更的容器。数据持久化在 `./data/` 中，普通 `docker compose down` 不会删除数据。
 
 ### 更新现有项目
 
@@ -79,7 +81,7 @@ docker compose build ao3-backup
 docker compose up -d --force-recreate ao3-backup ao3-web
 ~~~
 
-现有 `archive` 卷会随原项目继续挂载，程序启动时会升级库结构。打开总览点击「重试失败或缺失项」补齐当前数据库中的正文。备份容器使用宿主机的日志驱动。群晖可在 Container Manager 的 `ao3-backup` 容器详情中查看「日志」。可同时通过总览的「运行日志」查看卷内的文件日志 `/data/logs/ao3_backup.log`。
+现有 `./data` 目录会随原项目继续挂载，程序启动时会升级库结构。打开总览点击「重试失败或缺失项」补齐当前数据库中的正文。备份容器使用宿主机的日志驱动。群晖可在 Container Manager 的 `ao3-backup` 容器详情中查看「日志」。可同时通过总览的「运行日志」查看目录内的文件日志 `./data/logs/ao3_backup.log`。
 
 ## 从旧版迁移
 
