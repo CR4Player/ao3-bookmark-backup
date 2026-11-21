@@ -825,12 +825,29 @@ class SQLiteArchiveTests(unittest.TestCase):
             status, _, _ = fetch(opener, "/fonts/wenkai/files/../../etc/passwd")
             self.assertEqual(status, 404)
 
+            status, svg_headers, svg_body = fetch(opener, "/favicon.svg")
+            self.assertEqual(status, 200)
+            self.assertIn("image/svg+xml", svg_headers.get("Content-Type", ""))
+            self.assertIn("img-src 'self'", svg_headers.get("Content-Security-Policy", ""))
+            self.assertIn("<svg", svg_body)
+            with opener.open(base + "/favicon.ico", timeout=5) as ico_resp:
+                self.assertEqual(ico_resp.status, 200)
+                self.assertIn("image/x-icon", ico_resp.headers.get("Content-Type", ""))
+                self.assertTrue(ico_resp.read().startswith(b"\x00\x00\x01\x00"))
+            with opener.open(base + "/apple-touch-icon.png", timeout=5) as png_resp:
+                self.assertEqual(png_resp.status, 200)
+                self.assertIn("image/png", png_resp.headers.get("Content-Type", ""))
+                self.assertTrue(png_resp.read().startswith(b"\x89PNG"))
+
             status, headers, _ = fetch(opener, "/")
             self.assertEqual(status, 303)
             self.assertEqual(headers["Location"], "/setup")
 
             status, _, setup_body = fetch(opener, "/setup")
             self.assertEqual(status, 200)
+            self.assertIn('href="/favicon.svg"', setup_body)
+            self.assertIn('href="/favicon.ico"', setup_body)
+            self.assertIn('href="/apple-touch-icon.png"', setup_body)
             self.assertNotIn('name="ao3_auth_mode"', setup_body)
             self.assertNotIn('name="bookmark_user"', setup_body)
             proof_val = setup_body.split('name="proof" value="', 1)[1].split('"', 1)[0]

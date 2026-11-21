@@ -62,7 +62,7 @@ MIMES = {
     "epub": "application/epub+zip", "pdf": "application/pdf",
     "mobi": "application/x-mobipocket-ebook", "azw3": "application/vnd.amazon.ebook",
 }
-PAGE_POLICY = "default-src 'none'; style-src 'self'; script-src 'self'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+PAGE_POLICY = "default-src 'none'; style-src 'self'; script-src 'self'; font-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
 READER_POLICY = PAGE_POLICY
 DASHBOARD_POLICY = READER_POLICY + "; connect-src 'self'"
 FILE_POLICY = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'; base-uri 'none'"
@@ -222,12 +222,17 @@ def page(
   </div>
 </div>"""
     brand_href = escape(brand if auth_mode == "app" else "#")
+    icon_links = (
+        '<link rel="icon" href="/favicon.svg" type="image/svg+xml">'
+        '<link rel="icon" href="/favicon.ico" sizes="any">'
+        '<link rel="apple-touch-icon" href="/apple-touch-icon.png">'
+    )
     font_link = '<link rel="stylesheet" href="/fonts/wenkai/style.css">' if reading else ""
     main_cls = "wrap reader-main" if reading else "wrap"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{escape(title)} · AO3 书签备份</title>{script_tags}{font_link}<link rel="stylesheet" href="/archive.css"></head>
+<title>{escape(title)} · AO3 书签备份</title>{icon_links}{script_tags}{font_link}<link rel="stylesheet" href="/archive.css"></head>
 <body{body_class}><a class="skip" href="#main">跳到内容</a>
 <header class="top"><div class="wrap top-row">
 <div class="brand-group"><a class="brand" href="{brand_href}"><span>AO3</span> 书签备份</a>{nav_links}</div>
@@ -1965,6 +1970,9 @@ def serve(
     css = Path(__file__).with_name("ao3_web.css").read_bytes()
     backup_script = Path(__file__).with_name("ao3_web.js").read_bytes()
     reader_script = Path(__file__).with_name("ao3_reader.js").read_bytes()
+    favicon_svg = Path(__file__).with_name("ao3_favicon.svg").read_bytes()
+    favicon_ico = Path(__file__).with_name("ao3_favicon.ico").read_bytes()
+    apple_touch_icon = Path(__file__).with_name("ao3_apple_touch_icon.png").read_bytes()
     wenkai_dir = Path(__file__).with_name("fonts") / "wenkai"
     wenkai_files_dir = wenkai_dir / "files"
     wenkai_css = (wenkai_dir / "style.css").read_bytes() if (wenkai_dir / "style.css").is_file() else b""
@@ -2281,6 +2289,15 @@ def serve(
                     )
                 else:
                     self.respond(404, "找不到字体分片", "text/plain; charset=utf-8")
+                return
+            if path == "/favicon.svg":
+                self.respond(200, favicon_svg, "image/svg+xml; charset=utf-8", cache_control="public, max-age=86400")
+                return
+            if path == "/favicon.ico":
+                self.respond(200, favicon_ico, "image/x-icon", cache_control="public, max-age=86400")
+                return
+            if path == "/apple-touch-icon.png":
+                self.respond(200, apple_touch_icon, "image/png", cache_control="public, max-age=86400")
                 return
 
             has_auth = archive.has_web_auth()
