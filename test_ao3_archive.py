@@ -519,6 +519,23 @@ class SQLiteArchiveTests(unittest.TestCase):
         self.assertIn("<mark>新内容</mark>", diff_html)
         self.assertIn("…", diff_html)
 
+        word_diff_html = render_diff(Difference("作品资料", "字数", ("4,120",), ("8,350",)))
+        self.assertIn("4,120 字", word_diff_html)
+        self.assertIn("8,350 字", word_diff_html)
+        self.assertIn("+4,230 字", word_diff_html)
+
+        pure_add_diff = render_diff(Difference("第 1 章", "正文", ("第一段",), ("第一段", "新增的第二段")))
+        self.assertIn('class="diff-pair is-single"', pure_add_diff)
+        self.assertIn("新增段落", pure_add_diff)
+        self.assertIn("新增的第二段", pure_add_diff)
+        self.assertNotIn('class="diff-key"', pure_add_diff)
+
+        tag_add_diff = render_diff(Difference("作品资料", "附加标签", ("旧标签",), ("旧标签", "新标签")))
+        self.assertIn('class="diff-pair is-single"', tag_add_diff)
+        self.assertIn(">新增<", tag_add_diff)
+        self.assertNotIn("新增段落", tag_add_diff)
+        self.assertNotIn('class="diff-key"', tag_add_diff)
+
         self.scan(100, self.old)
         self.scan(200, self.new)
         _, versions, _, _ = self.detail()
@@ -531,6 +548,9 @@ class SQLiteArchiveTests(unittest.TestCase):
         self.assertIn('id="reader-font"', page_html)
         self.assertIn('id="reader-size"', page_html)
         self.assertIn('id="reader-width"', page_html)
+        self.assertIn('id="reader-sidebar"', page_html)
+        self.assertIn('id="reader-sidebar-toggle"', page_html)
+        self.assertIn('id="reading-progress"', page_html)
         for theme_id in ("sage", "lavender", "crimson", "dusk", "midnight"):
             self.assertIn(f'value="{theme_id}"', page_html)
         self.assertNotIn("章节目录 · 1 章", page_html)

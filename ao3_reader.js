@@ -3,10 +3,14 @@ const themeKey = 'ao3-reader-theme';
 const fontKey = 'ao3-reader-font';
 const sizeKey = 'ao3-reader-size';
 const widthKey = 'ao3-reader-width';
+const densityKey = 'ao3-reader-density';
+const sidebarKey = 'ao3-reader-sidebar';
 const themes = ['system', 'day', 'sage', 'lavender', 'sepia', 'crimson', 'night', 'dusk', 'midnight'];
 const fonts = ['serif', 'sans', 'kaiti', 'system'];
 const sizes = ['small', 'medium', 'large', 'xlarge'];
 const widths = ['narrow', 'medium', 'wide'];
+const densities = ['compact', 'cozy'];
+const sidebars = ['open', 'collapsed'];
 const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
 
 function readPref(key, allowed, fallback) {
@@ -31,6 +35,8 @@ let theme = readPref(themeKey, themes, 'system');
 let fontFamily = readPref(fontKey, fonts, 'serif');
 let fontSize = readPref(sizeKey, sizes, 'medium');
 let pageWidth = readPref(widthKey, widths, 'medium');
+let listDensity = readPref(densityKey, densities, 'compact');
+let readerSidebar = readPref(sidebarKey, sidebars, 'open');
 
 function applyPrefs() {
   const preferred = systemTheme.matches ? 'night' : 'day';
@@ -38,26 +44,117 @@ function applyPrefs() {
   document.documentElement.dataset.readerFont = fontFamily;
   document.documentElement.dataset.readerSize = fontSize;
   document.documentElement.dataset.readerWidth = pageWidth;
+  document.documentElement.dataset.readerDensity = listDensity;
+  document.documentElement.dataset.readerSidebar = readerSidebar;
+}
+
+function switchThemeInstant() {
+  const root = document.documentElement;
+  root.classList.add('is-theme-switching');
+  applyPrefs();
+  void root.offsetHeight;
+  root.classList.remove('is-theme-switching');
 }
 
 applyPrefs();
-systemTheme.addEventListener('change', applyPrefs);
+systemTheme.addEventListener('change', switchThemeInstant);
 
 document.addEventListener('DOMContentLoaded', () => {
-  const bindSelect = (selector, current, setter, key) => {
+  const bindSelect = (selector, current, setter, key, onApply = applyPrefs) => {
     const el = document.querySelector(selector);
     if (!el) return;
     el.value = current;
     el.addEventListener('change', () => {
       setter(el.value);
-      applyPrefs();
+      onApply();
       savePref(key, el.value);
     });
   };
-  bindSelect('#reader-theme', theme, v => { theme = v; }, themeKey);
+  bindSelect('#reader-theme', theme, v => { theme = v; }, themeKey, switchThemeInstant);
   bindSelect('#reader-font', fontFamily, v => { fontFamily = v; }, fontKey);
   bindSelect('#reader-size', fontSize, v => { fontSize = v; }, sizeKey);
   bindSelect('#reader-width', pageWidth, v => { pageWidth = v; }, widthKey);
+
+  // Overview list density switcher (compact / cozy).
+  const densityBtns = Array.from(document.querySelectorAll('.density-switch [data-density]'));
+  if (densityBtns.length) {
+    const syncDensityBtns = () => {
+      for (const btn of densityBtns) {
+        btn.classList.toggle('is-active', btn.dataset.density === listDensity);
+      }
+    };
+    for (const btn of densityBtns) {
+      btn.addEventListener('click', () => {
+        const val = btn.dataset.density;
+        if (densities.includes(val)) {
+          listDensity = val;
+          applyPrefs();
+          savePref(densityKey, val);
+          syncDensityBtns();
+        }
+      });
+    }
+    syncDensityBtns();
+  }
+
+  // Reader sidebar collapse / expand toggle & reading progress bar.
+  const sidebarToggle = document.querySelector('#reader-sidebar-toggle');
+  const syncSidebarBtn = () => {
+    if (!sidebarToggle) return;
+    const collapsed = readerSidebar === 'collapsed';
+    sidebarToggle.textContent = collapsed ? '⇥ 展开侧栏' : '⇤ 收起侧栏';
+    sidebarToggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  };
+  const setSidebarState = next => {
+    readerSidebar = next === 'collapsed' ? 'collapsed' : 'open';
+    applyPrefs();
+    savePref(sidebarKey, readerSidebar);
+    syncSidebarBtn();
+  };
+  if (sidebarToggle) {
+    sidebarToggle.addEventListener('click', () => {
+      setSidebarState(readerSidebar === 'collapsed' ? 'open' : 'collapsed');
+    });
+    syncSidebarBtn();
+  }
+
+  const progressBar = document.querySelector('#reading-progress');
+  const chapterEls = Array.from(document.querySelectorAll('.article-chapter[id]'));
+  const tocLinks = new Map(
+    Array.from(document.querySelectorAll('.toc-list a[href^="#"]')).map(a => [a.getAttribute('href').slice(1), a])
+  );
+  if (progressBar || chapterEls.length > 1) {
+    let scrollTick = false;
+    const updateReadingProgress = () => {
+      scrollTick = false;
+      const docEl = document.documentElement;
+      const maxScroll = Math.max(1, docEl.scrollHeight - window.innerHeight);
+      const ratio = Math.min(1, Math.max(0, window.scrollY / maxScroll));
+      if (progressBar) {
+        progressBar.style.width = `${(ratio * 100).toFixed(1)}%`;
+      }
+      if (chapterEls.length > 1 && tocLinks.size) {
+        let activeId = chapterEls[0].id;
+        for (const ch of chapterEls) {
+          if (ch.getBoundingClientRect().top <= 140) {
+            activeId = ch.id;
+          } else {
+            break;
+          }
+        }
+        for (const [id, link] of tocLinks.entries()) {
+          link.classList.toggle('is-current', id === activeId);
+        }
+      }
+    };
+    window.addEventListener('scroll', () => {
+      if (!scrollTick) {
+        scrollTick = true;
+        window.requestAnimationFrame(updateReadingProgress);
+      }
+    }, { passive: true });
+    updateReadingProgress();
+  }
 
   // Auto-apply overview sort selection and search clear without requiring a separate button.
   for (const sel of document.querySelectorAll('select[data-auto-submit]')) {
@@ -105,6 +202,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const toc = document.querySelector('#toc');
   const openToc = () => {
     if (!toc) return;
+    if (readerSidebar === 'collapsed') {
+      setSidebarState('open');
+    }
     toc.open = true;
     toc.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };

@@ -140,6 +140,28 @@ def hidden_fields(query: dict[str, str]) -> str:
                    for key, value in query.items())
 
 
+def _rating_badge(tags: dict[str, tuple[str, ...]], record: dict | None = None) -> str:
+    items = tags.get("分级") or ()
+    if not items and record:
+        raw = record.get("rating")
+        items = (raw,) if isinstance(raw, str) and raw else tuple(raw or ())
+    if not items:
+        return ""
+    first = items[0]
+    low = first.casefold()
+    if "general" in low or "全年龄" in low or low == "g":
+        short, cls = "G", "rating-g"
+    elif "teen" in low or "青少年" in low or low == "t":
+        short, cls = "T", "rating-t"
+    elif "mature" in low or "成熟" in low or low == "m":
+        short, cls = "M", "rating-m"
+    elif "explicit" in low or "成人" in low or low == "e":
+        short, cls = "E", "rating-e"
+    else:
+        short, cls = "NR", "rating-nr"
+    return f'<span class="rating-badge {cls}" title="{escape(first)}">{short}</span>'
+
+
 def page(
     title: str, contents: str, *, detail: bool = False, dashboard: bool = False,
     reading: bool = False, auth_mode: str = "app", active_nav: str = "",
@@ -151,12 +173,12 @@ def page(
         scripts.append('<script src="/backup.js" defer></script>')
     script_tags = "".join(scripts)
     body_class = ' class="reader-page"' if reading else ""
-    theme_picker = """<label class="reader-theme"><span>配色</span>
+    theme_picker = """<label class="reader-theme" title="切换配色方案"><i class="swatch-dot" aria-hidden="true"></i><span class="sr-only">配色</span>
 <select id="reader-theme"><option value="system">跟随系统</option>
-<optgroup label="浅色方案"><option value="day">晴空蓝（白天）</option><option value="sage">鼠尾草（护眼绿）</option>
-<option value="lavender">薰衣草（柔紫）</option><option value="sepia">羊皮纸（暖色）</option>
-<option value="crimson">经典绯红（AO3）</option></optgroup>
-<optgroup label="深色方案"><option value="night">深邃灰（夜间）</option><option value="dusk">暮夜星辰（深蓝紫）</option>
+<optgroup label="浅色方案"><option value="day">羊皮纸（日间）</option><option value="sepia">旧书页（暖棕）</option>
+<option value="crimson">经典绯红（AO3）</option><option value="sage">鼠尾草（护眼绿）</option>
+<option value="lavender">薰衣草（柔紫）</option></optgroup>
+<optgroup label="深色方案"><option value="night">深林夜读（夜间）</option><option value="dusk">暮夜星辰（深蓝紫）</option>
 <option value="midnight">暗夜森林（深墨绿）</option></optgroup></select></label>"""
     nav_items = (
         ("overview", "/", "总览"),
@@ -165,6 +187,8 @@ def page(
         ("account", "/account", "账号安全"),
     )
     nav_links = ""
+    logout_btn = ""
+    density_switch = ""
     confirm_modal = ""
     if auth_mode == "app":
         links = "".join(
@@ -172,7 +196,13 @@ def page(
             f'{" aria-current=\"page\"" if active_nav == key else ""}>{label}</a>'
             for key, href, label in nav_items
         )
-        logout_btn = ""
+        nav_links = f'<nav class="top-nav" aria-label="主导航">{links}</nav>'
+        if active_nav == "overview":
+            density_switch = (
+                '<div class="density-switch" role="group" aria-label="列表密度">'
+                '<button type="button" data-density="compact" class="is-active">紧凑</button>'
+                '<button type="button" data-density="cozy">舒适</button></div>'
+            )
         if logout_proof:
             logout_btn = (
                 f'<form id="site-logout-form" class="top-nav-logout" method="post" action="/logout">'
@@ -191,17 +221,17 @@ def page(
     <button class="button small danger" type="button" data-confirm-accept>确认</button>
   </div>
 </div>"""
-        nav_links = f'<nav class="top-nav" aria-label="主导航">{links}{logout_btn}</nav>'
     brand_href = escape(brand if auth_mode == "app" else "#")
+    main_cls = "wrap reader-main" if reading else "wrap"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{escape(title)} · AO3 书签备份</title>{script_tags}<link rel="stylesheet" href="/archive.css"></head>
 <body{body_class}><a class="skip" href="#main">跳到内容</a>
 <header class="top"><div class="wrap top-row">
-<a class="brand" href="{brand_href}"><span>AO3</span> 书签备份</a>
-<div class="top-actions">{theme_picker}{nav_links}</div></div></header>
-<main class="wrap" id="main">{contents}</main>{confirm_modal}</body></html>"""
+<div class="brand-group"><a class="brand" href="{brand_href}"><span>AO3</span> 书签备份</a>{nav_links}</div>
+<div class="top-actions">{density_switch}{theme_picker}{logout_btn}</div></div></header>
+<main class="{main_cls}" id="main">{contents}</main>{confirm_modal}</body></html>"""
 
 
 def work_title(wid: str, record: dict, saved_title: str = "") -> str:
@@ -824,27 +854,27 @@ def backup_panel(
         feedback = f'<p class="warning notice" role="alert">{escape(error)}</p>'
     elif notice in BACKUP_NOTICES:
         feedback = f'<p class="notice is-info" role="status">{BACKUP_NOTICES[notice]}</p>'
-    return f"""<section class="backup-panel" id="backup" aria-labelledby="backup-heading">
+    return f"""<section class="backup-panel is-strip" id="backup" aria-labelledby="backup-heading">
 <div class="backup-heading">
-  <div class="backup-title-wrap">
-    <h2 id="backup-heading">抓取管理</h2>
+  <div class="backup-title-wrap" role="status">
+    <h2 class="sr-only" id="backup-heading">抓取管理</h2>
     <span class="backup-status-inline" id="backup-status" data-status="{escape(status['tone'])}">
       <i class="status-dot" aria-hidden="true"></i>
       <span id="backup-state">{escape(status['state'])}</span>
     </span>
+    <span class="strip-sep" aria-hidden="true">·</span>
+    <span class="muted" id="backup-previous">{escape(status['previous'])}</span>
+    <span class="strip-sep" aria-hidden="true">·</span>
+    <span class="muted" id="backup-upcoming">{escape(status['upcoming'])}</span>
+    <a class="text-link refresh-hint" id="backup-refresh-hint" href="{list_url}" hidden>有新归档完成，点击刷新列表</a>
   </div>
   <form class="backup-actions" method="post" action="{post_url}">{proof_field}
-    <button class="button primary" type="submit" name="action" value="scan">立即刷新</button>
-    <button class="button" type="submit" name="action" value="retry">重试失败或缺失项</button>
-    <a class="button" id="backup-refresh-list" href="{list_url}">更新列表</a>
+    <button class="button small" type="submit" name="action" value="retry">重试失败或缺失项</button>
+    <button class="button small primary" type="submit" name="action" value="scan">立即刷新</button>
+    <a class="button small js-hide" id="backup-refresh-list" href="{list_url}">更新列表</a>
   </form>
 </div>
-{feedback}
-<div class="backup-meta" role="status">
-  <p class="muted" id="backup-previous">{escape(status['previous'])}</p>
-  <p class="muted" id="backup-upcoming">{escape(status['upcoming'])}</p>
-  <a class="text-link refresh-hint" id="backup-refresh-hint" href="{list_url}" hidden>有新归档完成，点击刷新列表</a>
-</div></section>"""
+{feedback}</section>"""
 
 
 def schedule_html(
@@ -1009,18 +1039,6 @@ def overview_html(
                    f'<a class="filter-chip{" is-active" if wip else ""}" href="{wip_url}">连载中 <span>{wip_count}</span></a>'
                    f'<a class="filter-chip{" is-active" if noted else ""}" href="{noted_url}">含书签备注 <span>{noted_count}</span></a>'
                    f'</div>')
-    options = "".join(f'<option value="{key}"{" selected" if key == sort else ""}>{label}</option>'
-                      for key, label in SORTS.items())
-    hidden = hidden_fields({key: value for key, value in context.items() if key not in {"q", "sort", "page"}})
-    toolbar = f"""<div class="controls">
-  <div class="controls-top"><nav class="tabs" aria-label="作品筛选">{''.join(tabs)}</nav>{extra_pills}</div>
-  <form class="search" method="get" action="/">{hidden}
-    <label class="sr-only" for="search">搜索作品</label>
-    <input type="search" id="search" name="q" placeholder="搜索 ID、标题、作者、标签或备注（回车搜索）…" maxlength="200" value="{escape(q)}">
-    <label class="sr-only" for="sort">排序方式</label><select id="sort" name="sort" data-auto-submit>{options}</select>
-    <button class="button js-hide" type="submit">应用</button>
-  </form>
-</div>"""
     chip_parts = []
     if author:
         clear_url = escape(home_url(view, q, sort, tag=tag, wip=wip, noted=noted))
@@ -1067,9 +1085,28 @@ def overview_html(
         seen_url = escape(with_query("/overview/seen", {k: v for k, v in page_context.items() if k != "page"}))
         proof_input = hidden_fields({"proof": backup_proof(reader["id"])})
         visit_bar = f"""<div class="visit-bar" role="region" aria-label="访问后更新提示">
-  <span>上次访问后有 <strong>{counts['since']}</strong> 篇作品变更</span>
+  <span>上次访问后 <strong>{counts['since']}</strong> 篇变更</span>
   <form method="post" action="{seen_url}">{proof_input}
-    <button class="button small" type="submit">标为已查看</button>
+    <button class="button small primary" type="submit">✓ 标为已查看</button>
+  </form>
+</div>"""
+
+    count_label = (f"第 {current_page}/{total_pages} 页 · 共 {total_matched} 篇"
+                   if total_pages > 1 else f"共 {total_matched} 篇作品")
+    options = "".join(f'<option value="{key}"{" selected" if key == sort else ""}>排序：{label}</option>'
+                      for key, label in SORTS.items())
+    hidden = hidden_fields({key: value for key, value in context.items() if key not in {"q", "sort", "page"}})
+    toolbar = f"""<div class="controls">
+  <div class="controls-top">
+    <div class="controls-tabs-wrap"><nav class="tabs" aria-label="作品筛选">{''.join(tabs)}</nav>{extra_pills}</div>
+    {visit_bar}
+  </div>
+  <form class="search" method="get" action="/">{hidden}
+    <label class="sr-only" for="search">搜索作品</label>
+    <input type="search" id="search" name="q" placeholder="搜索 ID、标题、作者、原作、CP、标签或书签备注（回车搜索）…" maxlength="200" value="{escape(q)}">
+    <label class="sr-only" for="sort">排序方式</label><select id="sort" name="sort" data-auto-submit>{options}</select>
+    <button class="button js-hide" type="submit">应用</button>
+    <span class="result-count muted">{count_label}</span>
   </form>
 </div>"""
 
@@ -1094,12 +1131,10 @@ def overview_html(
             '<p class="notice is-info">检测到环境变量仍存有明文 AO3 账号，建议前往 '
             '<a class="text-link" href="/account">账号安全</a> 在线校验并转为加密存储或仅保存 Cookie，随后可从 .env 移除。</p>'
         )
-    count_label = (f"第 {current_page}/{total_pages} 页 · 共 {total_matched} 篇"
-                   if total_pages > 1 else f"{total_matched} 篇作品")
     pagination = _pagination_html(page_context, current_page, total_pages)
     return page("作品总览", f"""
-<div class="page-heading"><h1>作品总览</h1><span class="muted">{count_label}</span></div>
-{credential_banner}{panel}{toolbar}{filters}{visit_bar}
+<div class="page-heading sr-only"><h1>作品总览</h1><span class="muted">{count_label}</span></div>
+{credential_banner}{panel}{toolbar}{filters}
 <section class="results" aria-label="{VIEWS[view]}">
 <ul class="work-list" role="list">{rendered}</ul>{pagination}</section>""", dashboard=True, active_nav="overview", logout_proof=backup_proof(reader["id"]))
 
@@ -1112,10 +1147,11 @@ def overview_row(row: dict, context: dict[str, str]) -> str:
     title_target = with_query(f"/works/{wid}/latest", context) if readable else with_query(f"/works/{wid}", context)
     title_url = escape(title_target)
     title = escape(row["title"])
+    rating_badge = _rating_badge(row["tags"], record)
 
     authors = "、".join(escape(name) if name.casefold() == "anonymous" else filter_link(name, "author", sort=sort)
                        for name in row["authors"])
-    byline = f'<p class="byline"><span>作者</span> {authors}</p>' if authors else ""
+    byline = f'<p class="byline"><span>by</span> {authors}</p>' if authors else ""
     tags = render_tag_groups(row["tags"], sort=sort, collapse_limit=10, compact_meta=True)
 
     summary_text = str(record.get("summary") or "").strip()
@@ -1160,35 +1196,44 @@ def overview_row(row: dict, context: dict[str, str]) -> str:
     badge = f'<span class="muted">{count} 次变化</span>' if view == "since" and count > 1 else ""
     kind = KINDS.get(row["kind"], "")
     kind_line = f'<span class="change-kind">{kind}</span>' if kind else ""
-    reading = ""
+    reading_action = ""
     attachment = ""
     if not readable:
-        reading = '<span class="muted">暂无可读正文</span>'
+        reading_action = '<span class="muted">暂无可读正文</span>'
         if row["formats"] and latest:
             attachment = download_menu(wid, latest, has_article=False, formats=row["formats"], compact=True)
     elif readable != latest:
-        reading = '<span class="muted">可读留存版</span>'
+        reading_action = f'<a class="action-link" href="{title_url}">阅读留存版</a>'
+    else:
+        reading_action = f'<a class="action-link is-primary" href="{title_url}">阅读全文</a>'
 
     chapters = escape(str(record.get("chapters") or ""))
     chapter_cls = "stat-pill is-wip" if row["is_wip"] else "stat-pill"
-    chapter_count = f'<span class="{chapter_cls}">{chapters} 章</span>' if chapters else ""
+    chapter_prefix = "连载 " if row["is_wip"] else ""
+    chapter_count = f'<span class="{chapter_cls}">{chapter_prefix}{chapters} 章</span>' if chapters else ""
     words = record.get("words")
     word_count = f'<span class="stat-pill">{words:,} 字</span>' if isinstance(words, int) and words > 0 else ""
     downloaded_at = record.get("downloaded_at")
     backup_time = (f'<span>备份 <time class="stamp">{date_label(downloaded_at)}</time></span>'
                    if downloaded_at else "")
-    ao3_id_link = (f'<a class="stat-id" href="https://archiveofourown.org/works/{wid}" '
+    ao3_id_link = (f'<a class="action-link stat-id" href="https://archiveofourown.org/works/{wid}" '
                    f'rel="noreferrer" target="_blank" title="在 AO3 打开原页">#{wid} ↗</a>')
     body_cls = "work-body has-about" if tags and card_about else "work-body"
     card_body = f'<div class="{body_cls}">{tags}{card_about}</div>' if (tags or card_about) else ""
-    return f"""<li class="work-row{' is-unread' if row['unread'] else ''}">
-<div class="row-head"><h2 class="row-title"><a href="{title_url}">{title}</a></h2>
-<div class="work-subline">{byline}<div class="work-stats muted">{ao3_id_link}{chapter_count}{word_count}
-<span>AO3 更新 <time class="stamp">{date_label(record.get('updated_at'))}</time></span>{backup_time}</div></div></div>
+    row_cls = "work-row" + (" is-unread" if row["unread"] else "") + (" is-failed" if row["failed"] else "")
+    return f"""<li class="{row_cls}">
+<div class="row-head">
+  <div class="row-title-group">{rating_badge}<h2 class="row-title"><a href="{title_url}">{title}</a></h2>{byline}</div>
+  <div class="row-head-right">{unread}{kind_line}{badge}{failure}{chapter_count}{word_count}</div>
+</div>
 {card_body}
-<div class="work-footer"><div class="change-info"><div class="change-status">{unread}{kind_line}{badge}{failure}</div>
-<ul class="change-labels">{changes}</ul></div>
-<div class="work-actions">{reading}{attachment}<a class="icon-link" href="{versions_url}" aria-label="版本与差异" title="版本与差异"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg></a></div></div></li>"""
+<div class="work-footer">
+  <div class="change-info"><ul class="change-labels">{changes}</ul></div>
+  <div class="work-actions">
+    <span class="work-stats muted"><span>AO3 <time class="stamp">{date_label(record.get('updated_at'))}</time></span>{backup_time}</span>
+    {reading_action}{attachment}<a class="action-link" href="{versions_url}">版本与差异</a>{ao3_id_link}
+  </div>
+</div></li>"""
 
 
 def version_name(version: Version, number: int) -> str:
@@ -1264,7 +1309,33 @@ def _highlight_pair(old: str, new: str) -> tuple[str, str]:
     return old_html, new_html
 
 
-def render_diff(diff: Difference) -> str:
+def _format_numeric_diff(diff: Difference) -> tuple[str, str, str] | None:
+    if diff.section != "作品资料" or len(diff.before) != 1 or len(diff.after) != 1:
+        return None
+    old_val, new_val = diff.before[0].strip(), diff.after[0].strip()
+    old_num, new_num = old_val.replace(",", ""), new_val.replace(",", "")
+    if diff.label == "字数" and old_num.isdigit() and new_num.isdigit():
+        old_n, new_n = int(old_num), int(new_num)
+        delta = new_n - old_n
+        sign = f"+{delta:,}" if delta >= 0 else f"{delta:,}"
+        return f"{old_n:,} 字", f"{new_n:,} 字", f"{sign} 字"
+    if diff.label == "章节" and old_val and new_val:
+        return f"{old_val} 章", f"{new_val} 章", ""
+    return None
+
+
+def render_diff(diff: Difference, *, open_by_default: bool = True) -> str:
+    open_attr = " open" if open_by_default else ""
+    num_fmt = _format_numeric_diff(diff)
+    if num_fmt is not None:
+        old_txt, new_txt, delta_txt = num_fmt
+        badge = f' <span class="delta-badge">{escape(delta_txt)}</span>' if delta_txt else ""
+        rows = (
+            '<div class="diff-key"><span>旧版</span><span>新版</span></div>'
+            f'<div class="diff-pair"><p class="deletion">{escape(old_txt)}</p>'
+            f'<p class="addition"><mark>{escape(new_txt)}</mark>{badge}</p></div>'
+        )
+        return f'<details class="diff"{open_attr}><summary>{escape(diff.heading)}</summary><div class="diff-body">{rows}</div></details>'
     if not diff.before or not diff.after:
         added = bool(diff.after)
         paragraphs = diff.after if added else diff.before
@@ -1278,6 +1349,9 @@ def render_diff(diff: Difference) -> str:
     else:
         rows = []
         remaining = 0
+        has_pair = False
+        add_tag = "新增段落" if diff.label == "正文" else "新增"
+        del_tag = "删除段落" if diff.label == "正文" else "删除"
         for action, a, b, c, d in SequenceMatcher(None, diff.before, diff.after).get_opcodes():
             if action == "equal":
                 continue
@@ -1286,14 +1360,18 @@ def render_diff(diff: Difference) -> str:
                     remaining += 1
                     continue
                 if old and new:
+                    has_pair = True
                     old_html, new_html = _highlight_pair(old, new)
+                    rows.append(f'<div class="diff-pair"><p class="deletion">{old_html}</p>'
+                                f'<p class="addition">{new_html}</p></div>')
+                elif new:
+                    rows.append(f'<div class="diff-pair is-single"><p class="addition"><span class="diff-side-tag">{add_tag}</span>{escape(new)}</p></div>')
                 else:
-                    old_html, new_html = escape(old), escape(new)
-                rows.append(f'<div class="diff-pair"><p class="deletion">{old_html or "∅"}</p>'
-                            f'<p class="addition">{new_html or "∅"}</p></div>')
+                    rows.append(f'<div class="diff-pair is-single"><p class="deletion"><span class="diff-side-tag">{del_tag}</span>{escape(old)}</p></div>')
         tail = f'<p class="muted">另有 {remaining} 处改动，可打开全文查看。</p>' if remaining else ""
-        rows = '<div class="diff-key"><span>旧版</span><span>新版</span></div>' + "".join(rows) + tail
-    return f'<details class="diff"><summary>{escape(diff.heading)}</summary><div class="diff-body">{rows}</div></details>'
+        header = '<div class="diff-key"><span>旧版</span><span>新版</span></div>' if has_pair else ""
+        rows = header + "".join(rows) + tail
+    return f'<details class="diff"{open_attr}><summary>{escape(diff.heading)}</summary><div class="diff-body">{rows}</div></details>'
 
 
 def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) -> tuple[int, str]:
@@ -1320,7 +1398,7 @@ def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) 
         status = f"""<form method="post" action="{action}" class="read-form">
 <input type="hidden" name="through" value="{seq}">
 <input type="hidden" name="proof" value="{proof(reader['id'], wid, seq)}">
-<button class="button" type="submit">标为已读</button></form>"""
+<button class="button tonal" type="submit">✓ 标为已读</button></form>"""
 
     readable = next((v for v in reversed(versions.values()) if v.document_digest), None)
     article_fields: dict[str, tuple[str, ...]] = {}
@@ -1334,20 +1412,22 @@ def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) 
         " / ".join(record.get("fandoms") or article_fields.get("原作") or ()),
         f"{record['chapters']} 章" if record.get("chapters") else "",
         f"{record['words']:,} 字" if isinstance(record.get("words"), int) else "",
+        f"共 {len(order)} 个存档版本" if order else "",
     ]
     info_tail = escape(" · ".join(filter(None, info)))
     byline_html = f'<p class="muted work-meta-line">{authors_html}{(" · " + info_tail) if authors_html and info_tail else info_tail}</p>'
 
     work_tags = {label: names(article_fields.get(label) or record.get(key)) for label, key in TAG_GROUPS.items()}
+    rating_badge = _rating_badge(work_tags, record)
     tags_html = render_tag_groups(work_tags, sort=back["sort"])
-    tags_box = (f'<details class="about"><summary>作品标签</summary>{tags_html}</details>'
+    tags_box = (f'<details class="about dossier-pane" open><summary>作品标签</summary>{tags_html}</details>'
                 if tags_html else "")
 
     description = "".join(f'<section><h3>{label}</h3><p>{escape(value)}</p></section>'
                           for label, value in (("简介", record.get("summary") or ""),
                                                ("书签标签", " · ".join(record.get("bookmark_tags") or [])),
                                                ("书签备注", record.get("bookmark_notes") or "")) if value)
-    about = (f'<details class="about"><summary>简介和书签</summary>{description}</details>'
+    about = (f'<details class="about dossier-pane" open><summary>简介和书签</summary>{description}</details>'
              if description else "")
     error = record.get("last_error")
     if not error and record.get("failed_formats"):
@@ -1376,12 +1456,25 @@ def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) 
                 header_actions.append(menu)
         if newest:
             error_html += '<p class="notice muted">暂无可读正文。</p>'
+    if status:
+        header_actions.append(status)
     header_actions.append(f'<a class="button" href="https://archiveofourown.org/works/{wid}" rel="noreferrer" target="_blank">AO3 原页 ↗</a>')
 
-    heading = f"""<nav class="breadcrumbs"><a href="{escape(home_url(**back))}">作品总览</a>
+    unread_chip = '<span class="unread-label"><i></i>未读更新</span>' if unread else ""
+    dossier_grid = f'<div class="dossier-grid">{tags_box}{about}</div>' if (tags_box or about) else ""
+    heading = f"""<nav class="breadcrumbs"><a href="{escape(home_url(**back))}">← 作品总览</a>
 <span aria-hidden="true">/</span><span>版本与差异</span></nav>
-<div class="work-heading"><div><h1>{escape(title)}</h1>{byline_html}</div>
-{status}</div><div class="work-header-links">{"".join(header_actions)}</div>{tags_box}{about}{error_html}"""
+<section class="dossier-card">
+  <div class="work-heading">
+    <div class="work-title-block">
+      <div class="work-headline">{rating_badge}<h1>{escape(title)}</h1>{unread_chip}</div>
+      {byline_html}
+    </div>
+    <div class="work-header-links">{"".join(header_actions)}</div>
+  </div>
+  {dossier_grid}
+  {error_html}
+</section>"""
 
     if not order:
         return 200, page(title, heading + '<p class="empty">还没有成功保存的版本。</p>', detail=True, logout_proof=l_proof)
@@ -1436,10 +1529,20 @@ def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) 
         if missing_article:
             comparison += '<p class="notice muted">所选版本缺少可读正文。下方显示已留存的资料变更。</p>'
         if changes:
+            delta_items = []
+            for c in changes:
+                nf = _format_numeric_diff(c)
+                if nf:
+                    o_t, n_t, d_t = nf
+                    d_chip = f' <span class="delta-badge">{escape(d_t)}</span>' if d_t else ""
+                    delta_items.append(f'<span class="delta-item">{escape(c.label)}：<strong>{escape(o_t)}</strong> → <strong>{escape(n_t)}</strong>{d_chip}</span>')
+            delta_strip = f'<div class="delta-strip"><strong>数值变化：</strong>{" · ".join(delta_items)}</div>' if delta_items else ""
+            open_default = len(changes) <= 6
+            toggle_lbl = "收起全部差异" if open_default else "展开全部差异"
             diff_bar = (f'<div class="diffs-bar"><span class="muted">共 {len(changes)} 处差异</span>'
-                        '<button type="button" class="text-link diff-toggle-all" hidden>展开全部差异</button></div>'
+                        f'<button type="button" class="text-link diff-toggle-all" hidden>{toggle_lbl}</button></div>'
                         if len(changes) > 1 else "")
-            comparison += diff_bar + '<div class="diffs">' + "".join(render_diff(change) for change in changes) + '</div>'
+            comparison += delta_strip + diff_bar + '<div class="diffs">' + "".join(render_diff(change, open_by_default=open_default) for change in changes) + '</div>'
         elif not missing_article:
             changed_files = {k: f.digest for k, f in old.files.items()} != {k: f.digest for k, f in new.files.items()}
             desc = ("只检测到原始附件变化。" if changed_files else "文章内容和作品资料一致。")
@@ -1462,15 +1565,16 @@ def work_html(archive: Archive, reader: dict, wid: str, params: dict[str, str]) 
         link = f'<a class="text-link" href="{escape(pair)}#comparison">与上一版比较</a>' if pair else ""
         times = f"抓取 {date_label(version.captured_at)}" if version.origin != "metadata" else (
             f"记录 {date_label(event['happened_at'])}" if event else "资料快照")
-        timeline.append(f"""<li><div class="timeline-title"><strong>{escape(version_name(version, index + 1))}</strong>
-{mark}<span class="muted">{kind}</span></div><p class="muted">{times}</p>{issue}<ul class="change-labels">{labels_html}</ul>
-<div class="row-actions">{link}{version_files(wid, version, back)}</div></li>""")
+        node_cls = "v-node" + (" is-latest" if index == len(order) - 1 else "") + (" is-unread" if is_unread else "")
+        timeline.append(f"""<li class="{node_cls}"><div class="timeline-head"><div class="timeline-title"><strong>{escape(version_name(version, index + 1))}</strong>
+{mark}<span class="muted">{kind}</span></div><div class="row-actions">{link}{version_files(wid, version, back)}</div></div>
+<p class="muted timeline-stamp">{times}</p>{issue}<ul class="change-labels">{labels_html}</ul></li>""")
     historical = []
     for event in events:
         if event["version_id"] is None:
             changes = field_differences(json.loads(event["legacy_changes"]))
             history = "".join(render_diff(change) for change in changes)
-            historical.append(f'<li><strong>{KINDS[event["kind"]]}</strong> · {date_label(event["happened_at"])}'
+            historical.append(f'<li class="v-node"><strong>{KINDS[event["kind"]]}</strong> · {date_label(event["happened_at"])}'
                               f'<p class="muted">旧库仅留存变更记录</p>{history}</li>')
     old_history = (f'<details><summary>旧库的资料变更记录</summary><ol class="timeline">{"".join(historical)}</ol></details>'
                    if historical else "")
@@ -1493,6 +1597,13 @@ def article_html(
                        else filter_link(name, "author", sort=sort_mode) for name in author_items)
     summary = article.sections.get("作品简介", list(values.pop("作品简介", ())))
 
+    rating_badge = _rating_badge(values, version.metadata)
+    quick_pills = []
+    for grp, cls in (("原作", "tag-group-fandoms"), ("关系标签", "tag-group-relationships"), ("角色标签", "tag-group-characters")):
+        for item in values.get(grp, ())[:3]:
+            quick_pills.append(f'<span class="side-tag {cls}">{filter_link(item, "tag", sort=sort_mode)}</span>')
+    quick_tags_html = f'<div class="side-quick-tags">{"".join(quick_pills)}</div>' if quick_pills else ""
+
     field_rows = []
     for label, items in values.items():
         if label in TAG_GROUPS:
@@ -1510,11 +1621,15 @@ def article_html(
     total_chapters = len(article.chapters)
     catalog = "".join(f'<li><a href="#chapter_{index}">{escape(chapter_heading(chapter, index))}</a></li>'
                       for index, chapter in enumerate(article.chapters, 1))
-    toc_html = (f'<details class="about" id="toc"><summary>章节目录 · {total_chapters} 章</summary><ol>{catalog}</ol></details>'
+    toc_html = (f'<div class="side-card"><details class="about toc-details" id="toc" open>'
+                f'<summary>章节目录 · {total_chapters} 章</summary><ol class="toc-list">{catalog}</ol></details></div>'
                 if total_chapters > 1 else "")
 
-    def note(label: str, nodes: Fragment, heading: str = "h3") -> str:
-        return f'<section class="article-note"><{heading}>{label}</{heading}>{reading_html(nodes)}</section>' if nodes else ""
+    def note(label: str, nodes: Fragment, heading: str = "h3", *, overline: str = "") -> str:
+        if not nodes:
+            return ""
+        sub = f'<span class="note-overline">{overline}</span>' if overline else ""
+        return f'<section class="article-note">{sub}<{heading}>{label}</{heading}>{reading_html(nodes)}</section>'
 
     chapters = []
     for index, chapter in enumerate(article.chapters, 1):
@@ -1526,11 +1641,12 @@ def article_html(
             if index < total_chapters:
                 nav_links.append(f'<a class="text-link" href="#chapter_{index + 1}">下一章 →</a>')
         chapter_nav = f'<nav class="chapter-nav" aria-label="章节切换">{"".join(nav_links)}</nav>' if nav_links else ""
+        step_label = f'<small class="chapter-step">{index} / {total_chapters}</small>' if total_chapters > 1 else ""
         chapters.append(f"""<section class="article-chapter" id="chapter_{index}">
-<h2>{escape(chapter_heading(chapter, index))}</h2>
-{note("章节简介", chapter.summary)}{note("章首作者附注", chapter.start_notes)}
+<h2 class="chapter-heading"><span>{escape(chapter_heading(chapter, index))}</span>{step_label}</h2>
+{note("章节简介", chapter.summary, overline="CHAPTER SUMMARY")}{note("章首作者附注", chapter.start_notes, overline="CHAPTER NOTE")}
 <div class="article-prose">{reading_html(chapter.body)}</div>
-{note("章末作者附注", chapter.end_notes)}{chapter_nav}</section>""")
+{note("章末作者附注", chapter.end_notes, overline="END NOTE")}{chapter_nav}</section>""")
     overview_url = escape(home_url(**back)) if back else "/"
     versions_url = escape(with_query(f"/works/{wid}", back))
     availability = ('<p class="notice">当前版本缺少可读正文，正在显示最近一份留存版。</p>'
@@ -1547,34 +1663,58 @@ def article_html(
               if article.hidden_fields else "")
     dl_menu = download_menu(wid, version.id, has_article=True, formats=version.files.keys())
     toc_fab = '<button type="button" class="button small fab-toc" id="reader-toc-btn">目录</button>' if total_chapters > 1 else ""
-    contents = f"""<article class="article">
-<nav class="breadcrumbs"><a href="{overview_url}">作品总览</a><span aria-hidden="true">/</span>
-<a href="{versions_url}">版本与差异</a><span aria-hidden="true">/</span><span>正文阅读</span></nav>
-<header><h1>{escape(title)}</h1><p class="muted article-author">{author}</p>
-<div class="reader-toolbar">
-  <span class="muted">抓取 {date_label(version.captured_at)}</span>
-  <div class="reader-prefs">
-    <label><span>字体</span><select id="reader-font">
-      <option value="serif">优雅衬线</option><option value="sans">现代黑体</option>
-      <option value="kaiti">温润楷体</option><option value="system">系统默认</option>
-    </select></label>
-    <label><span>字号</span><select id="reader-size">
-      <option value="small">小</option><option value="medium">标准</option>
-      <option value="large">大</option><option value="xlarge">特大</option>
-    </select></label>
-    <label><span>栏宽</span><select id="reader-width">
-      <option value="narrow">窄</option><option value="medium">适中</option>
-      <option value="wide">宽</option>
-    </select></label>
-  </div>
-  <div class="reader-actions">{dl_menu}<a class="button" href="{versions_url}">版本与差异</a></div>
-</div></header>
-{availability}
-<details class="about"><summary>作品资料</summary>{hidden}<dl class="article-fields">{tags}</dl></details>
-{note("作品简介", summary, "h2")}{note("作品首注", article.sections.get("作品首注", []), "h2")}
-{toc_html}
-{''.join(chapters)}{note("作品尾注", article.sections.get("作品尾注", []), "h2")}
-</article>
+    summary_block = note("作品简介", summary, "h2", overline="SUMMARY")
+    start_note_block = note("作品首注", article.sections.get("作品首注", []), "h2", overline="AUTHOR'S NOTE")
+    front_cls = "front-matter-grid is-pair" if (summary_block and start_note_block) else "front-matter-grid"
+    front_matter = f'<div class="{front_cls}">{summary_block}{start_note_block}</div>' if (summary_block or start_note_block) else ""
+    contents = f"""<div class="reading-progress" id="reading-progress" aria-hidden="true"></div>
+<nav class="breadcrumbs reader-breadcrumbs">
+  <div class="crumb-links"><a href="{overview_url}">← 作品总览</a><span aria-hidden="true">/</span>
+  <a href="{versions_url}">版本与差异</a><span aria-hidden="true">/</span><span>正文阅读</span></div>
+  <div class="crumb-meta"><span class="muted">抓取 {date_label(version.captured_at)}</span>
+  <button type="button" class="button small sidebar-toggle" id="reader-sidebar-toggle" title="收起或展开左侧书案栏">⇤ 收起侧栏</button></div>
+</nav>
+<div class="desk-grid">
+  <aside class="desk-sidebar" id="reader-sidebar" aria-label="阅读书案侧栏">
+    <div class="side-card">
+      <div class="side-work-head">{rating_badge}<strong class="side-work-title">{escape(title)}</strong></div>
+      <p class="muted side-work-author">{author}</p>
+      {quick_tags_html}
+      <div class="reader-actions side-actions">{dl_menu}<a class="button" href="{versions_url}">版本与差异</a></div>
+      <details class="about side-details"><summary>作品资料</summary>{hidden}<dl class="article-fields">{tags}</dl></details>
+    </div>
+    {toc_html}
+    <div class="side-card">
+      <div class="overline-label">TYPOGRAPHY · 阅读排版</div>
+      <div class="reader-prefs">
+        <label><span>字体</span><select id="reader-font">
+          <option value="serif">优雅衬线</option><option value="sans">现代黑体</option>
+          <option value="kaiti">温润楷体</option><option value="system">系统默认</option>
+        </select></label>
+        <label><span>字号</span><select id="reader-size">
+          <option value="small">小</option><option value="medium">标准</option>
+          <option value="large">大</option><option value="xlarge">特大</option>
+        </select></label>
+        <label><span>栏宽</span><select id="reader-width">
+          <option value="narrow">适中</option><option value="medium">宽幅</option>
+          <option value="wide">满屏</option>
+        </select></label>
+      </div>
+    </div>
+  </aside>
+  <article class="article reader-sheet-wide">
+    <header class="reader-head-compact">
+      <div class="reader-title-row">
+        <h1>{escape(title)}</h1>
+        <p class="muted article-author">{author}</p>
+      </div>
+      <a class="text-link muted" href="https://archiveofourown.org/works/{wid}" rel="noreferrer" target="_blank">AO3 #{wid} ↗</a>
+    </header>
+    {availability}
+    {front_matter}
+    {''.join(chapters)}{note("作品尾注", article.sections.get("作品尾注", []), "h2", overline="AFTERWORD")}
+  </article>
+</div>
 <div class="reader-fab" aria-label="阅读快捷导航">{toc_fab}<button type="button" class="button small" id="reader-top-btn">↑ 顶部</button></div>"""
     return page(title, contents, detail=True, reading=True, logout_proof=logout_proof)
 
