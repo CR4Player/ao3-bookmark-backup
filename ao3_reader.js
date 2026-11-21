@@ -340,12 +340,13 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // AO3 auth mode toggle in /setup and /account.
+  // AO3 auth mode toggle in /account.
   for (const scope of document.querySelectorAll('[data-ao3-auth-scope]')) {
     const radios = Array.from(scope.querySelectorAll('input[name="ao3_auth_mode"]'));
     const fieldsBox = scope.querySelector('[data-ao3-cred-fields]');
     const userInput = scope.querySelector('input[name="ao3_user"]');
     const pwInput = scope.querySelector('input[name="ao3_password"]');
+    const verifyWrap = scope.querySelector('[data-ao3-verify-wrap]');
     const modeHint = scope.querySelector('[data-ao3-mode-hint]');
     const pwHint = scope.querySelector('[data-ao3-pw-hint]');
 
@@ -360,6 +361,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const mode = checked ? checked.value : 'public';
       const isPublic = mode === 'public';
       if (fieldsBox) fieldsBox.hidden = isPublic;
+      if (verifyWrap) verifyWrap.hidden = mode !== 'encrypted';
       if (modeHint) modeHint.textContent = hints[mode] || '';
       if (userInput) userInput.required = !isPublic;
       if (pwInput) {

@@ -662,9 +662,10 @@ class Archive:
         token_path = self.root / SETUP_TOKEN_FILE
         if not token_path.exists():
             return False
-        expected = re.sub(r"[\s-]+", "", token_path.read_text(encoding="utf-8").upper())
-        supplied = re.sub(r"[\s-]+", "", (token or "").upper())
-        return bool(expected) and hmac.compare_digest(expected, supplied)
+        normalize_re = r"[\s\-\u2010-\u2015\u2212\uff0d]+"
+        expected = re.sub(normalize_re, "", token_path.read_text(encoding="utf-8").upper())
+        supplied = re.sub(normalize_re, "", (token or "").upper())
+        return bool(expected) and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))
 
     def setup_web_auth(self, password: str) -> str:
         if len(password) < 6:
@@ -701,7 +702,7 @@ class Archive:
         except (KeyError, ValueError):
             return False
         _, actual = _hash_password(password, salt)
-        return hmac.compare_digest(actual, expected)
+        return hmac.compare_digest(actual.encode("utf-8"), expected.encode("utf-8"))
 
     def change_web_password(self, current_password: str, new_password: str) -> str:
         if not self.verify_web_password(current_password):
@@ -750,7 +751,7 @@ class Archive:
             return False
         payload = f"{version}:{expires}"
         expected = hmac.new(bytes.fromhex(auth["session_secret"]), payload.encode("ascii"), "sha256").hexdigest()
-        return hmac.compare_digest(sig, expected)
+        return hmac.compare_digest(sig.encode("utf-8"), expected.encode("utf-8"))
 
     def ao3_credentials_status(self) -> dict[str, Any]:
         with self.connect(readonly=True) as db:

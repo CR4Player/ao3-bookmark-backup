@@ -717,6 +717,8 @@ class SQLiteArchiveTests(unittest.TestCase):
         token1 = self.archive.ensure_setup_token()
         self.assertEqual(token1, self.archive.ensure_setup_token())
         self.assertFalse(self.archive.verify_setup_token("WRONG-TOKEN"))
+        self.assertFalse(self.archive.verify_setup_token("中文口令—测试"))
+        self.assertTrue(self.archive.verify_setup_token(token1.replace("-", "—")))
         self.assertTrue(self.archive.verify_setup_token(token1.lower().replace("-", "")))
 
         sess1 = self.archive.setup_web_auth("sitepass123")
@@ -748,6 +750,8 @@ class SQLiteArchiveTests(unittest.TestCase):
 
         def fake_ao3_login(out_dir, user, password, *, timeout=60, prefer_v4=True):
             login_calls.append((user, password))
+            if password == "bad-ao3-password":
+                raise ValueError("AO3 登录失败：请核对用户名/密码，或确认未被验证码拦截")
             (out_dir / "cookies.txt").write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
 
         server_box = {}
@@ -793,28 +797,57 @@ class SQLiteArchiveTests(unittest.TestCase):
 
             status, _, setup_body = fetch(opener, "/setup")
             self.assertEqual(status, 200)
+            self.assertNotIn('name="ao3_auth_mode"', setup_body)
+            self.assertNotIn('name="bookmark_user"', setup_body)
             proof_val = setup_body.split('name="proof" value="', 1)[1].split('"', 1)[0]
             setup_token = self.archive.ensure_setup_token()
+
+            # Non-ASCII setup token returns clean 400 error instead of dropping the connection.
+            status, _, bad_setup_body = fetch(opener, "/setup", {
+                "proof": proof_val,
+                "setup_token": "错误—口令",
+                "web_password": "secret-site-password",
+                "web_password_confirm": "secret-site-password",
+            })
+            self.assertEqual(status, 400)
+            self.assertIn("初始化口令不正确", bad_setup_body)
+            self.assertFalse(self.archive.has_web_auth())
 
             status, headers, _ = fetch(opener, "/setup", {
                 "proof": proof_val,
                 "setup_token": setup_token,
                 "web_password": "secret-site-password",
                 "web_password_confirm": "secret-site-password",
-                "bookmark_user": "alice_bm",
-                "ao3_auth_mode": "cookie",
-                "ao3_user": "alice_ao3",
-                "ao3_password": "ao3-one-time-password",
-                "formats": ["epub"],
             })
             self.assertEqual((status, headers["Location"]), (303, "/"))
-            self.assertEqual(login_calls, [("alice_ao3", "ao3-one-time-password")])
-            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("cookie", "alice_ao3", ""))
+            self.assertEqual(login_calls, [])
 
             status, _, home_body = fetch(opener, "/")
             self.assertEqual(status, 200)
-            self.assertIn("alice_bm", home_body)
             self.assertIn("账号安全", home_body)
+            home_proof = home_body.split('name="proof" value="', 1)[1].split('"', 1)[0]
+
+            # Save bookmark user in overview backup settings after setup.
+            status, headers, _ = fetch(opener, "/backup", {
+                "proof": home_proof,
+                "action": "settings",
+                "bookmark_user": "alice_bm",
+                "formats_present": "1",
+                "formats": ["epub"],
+                "schedule_mode": "interval",
+                "interval_value": "6",
+                "interval_unit": "hour",
+                "anchor_mode": "fixed",
+                "run_at": "02:30",
+                "delay": "2",
+                "retries": "3",
+                "max_errors": "3",
+            })
+            self.assertEqual(status, 303)
+            self.assertIn("backup=saved", headers["Location"])
+            status, _, home_body = fetch(opener, "/")
+            self.assertEqual(status, 200)
+            self.assertIn("alice_bm", home_body)
 
             # Unauthenticated browser cannot access home or API status.
             anon = urllib.request.build_opener(NoRedirect())
@@ -841,6 +874,51 @@ class SQLiteArchiveTests(unittest.TestCase):
             status, _, acct_body = fetch(opener2, "/account")
             self.assertEqual(status, 200)
             acct_proof = acct_body.split('name="proof" value="', 1)[1].split('"', 1)[0]
+
+            # Invalid AO3 password is rejected immediately before writing to DB.
+            status, _, bad_cred_body = fetch(opener2, "/account", {
+                "proof": acct_proof,
+                "action": "credentials",
+                "ao3_auth_mode": "encrypted",
+                "ao3_user": "alice_ao3",
+                "ao3_password": "bad-ao3-password",
+                "verify_login": "1",
+            })
+            self.assertEqual(status, 400)
+            self.assertIn("AO3 登录失败", bad_cred_body)
+            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("", "", ""))
+
+            # Valid AO3 password passes live check, saves Cookie, and stores encrypted password.
+            status, headers, _ = fetch(opener2, "/account", {
+                "proof": acct_proof,
+                "action": "credentials",
+                "ao3_auth_mode": "encrypted",
+                "ao3_user": "alice_ao3",
+                "ao3_password": "good-ao3-password",
+                "verify_login": "1",
+            })
+            self.assertEqual((status, headers["Location"]), (303, "/account?saved=credentials_verified"))
+            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("encrypted", "alice_ao3", "good-ao3-password"))
+
+            # Switching to cookie-only validates live and drops saved password.
+            status, headers, _ = fetch(opener2, "/account", {
+                "proof": acct_proof,
+                "action": "credentials",
+                "ao3_auth_mode": "cookie",
+                "ao3_user": "alice_ao3",
+                "ao3_password": "ao3-one-time-password",
+            })
+            self.assertEqual((status, headers["Location"]), (303, "/account?saved=credentials_verified"))
+            self.assertEqual(self.archive.decrypted_ao3_credentials(), ("cookie", "alice_ao3", ""))
+            self.assertEqual(
+                login_calls,
+                [
+                    ("alice_ao3", "bad-ao3-password"),
+                    ("alice_ao3", "good-ao3-password"),
+                    ("alice_ao3", "ao3-one-time-password"),
+                ],
+            )
+
             status, headers, _ = fetch(opener2, "/account", {
                 "proof": acct_proof,
                 "action": "password",

@@ -4,10 +4,10 @@
 
 ## 全站鉴权与账号安全
 
-- **首次初始化向导（`/setup`）**：容器首次启动后访问网页会自动进入初始化向导，使用容器日志中输出的 `[SETUP]` 一次性初始化口令设置**全站访问密码**、目标书签用户名（`BOOKMARK_USER`）与官方附件格式，`.env` 无需填写任何明文账号密码。
+- **首次初始化向导（`/setup`）**：容器首次启动后访问网页会自动进入初始化向导，使用容器日志中输出的 `[SETUP]` 一次性初始化口令设置**全站访问密码**锁定站点，`.env` 无需填写任何明文账号密码。进入主页后，可在「抓取设置」填写目标书签用户名，并在「账号安全」（`/account`）配置 AO3 登录凭据。
 - **全站访问保护（`/login`）**：总览、作品阅读、差异对比、设置与导出接口均受会话 Cookie（`HttpOnly` + `SameSite=Strict` + HMAC 签名）保护。若忘记网页密码，可执行 `docker compose exec ao3-web python /app/ao3_backup.py --reset-web-auth` 重新生成初始化口令。
-- **两种 AO3 凭据存储方式（`/account`）**：
-  1. **加密保存密码**：通过 `cryptography.fernet` 与独立密钥文件（`/data/.credentials.key` 或环境变量 `AO3_MASTER_KEY`）加密存储，数据库快照不含明文，且支持 Cookie 失效后自动重登。
+- **两种 AO3 凭据存储方式（`/account`，支持保存前即时在线校验）**：
+  1. **加密保存密码**：默认在保存前立即联网向 AO3 校验账号密码有效性并同步缓存 Cookie，随后通过 `cryptography.fernet` 与独立密钥文件（`/data/.credentials.key` 或环境变量 `AO3_MASTER_KEY`）加密存储，数据库快照不含明文，且支持 Cookie 失效后自动重登。
   2. **仅登录保存 Cookie（推荐高敏场景）**：在网页端填写一次密码联网换取 Session 写入 `cookies.txt` 后立即丢弃密码，**密码零落盘**；当 Cookie 过期时页面会自动告警并引导重登。
   3. 也可保持**仅公开书签**模式不登录 AO3。
 

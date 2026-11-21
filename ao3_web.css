@@ -1490,7 +1490,8 @@ input[type=search] {
   margin-top: 10px;
 }
 
-.backup-form label.inline-check {
+.backup-form label.inline-check,
+.auth-form label.inline-check {
   flex-direction: row;
   align-items: center;
   gap: 7px;
@@ -1499,7 +1500,8 @@ input[type=search] {
   color: var(--ink-secondary);
 }
 
-.backup-form label.inline-check input {
+.backup-form label.inline-check input,
+.auth-form label.inline-check input {
   width: 16px;
   height: 16px;
   min-height: 0;
@@ -1507,6 +1509,10 @@ input[type=search] {
   margin: 0;
   accent-color: var(--red);
   flex-shrink: 0;
+}
+
+.auth-verify-row {
+  grid-column: 1 / -1;
 }
 
 .auth-shell {
@@ -1539,7 +1545,7 @@ input[type=search] {
   gap: 14px;
 }
 
-.auth-form label:not(.schedule-mode-pill):not(.format-chip) {
+.auth-form label:not(.schedule-mode-pill):not(.format-chip):not(.inline-check) {
   display: flex;
   flex-direction: column;
   gap: 5px;
