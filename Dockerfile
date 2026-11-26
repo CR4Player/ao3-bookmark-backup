@@ -54,7 +54,7 @@ COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --from=font-assets /fonts /app/fonts
-COPY ao3_backup.py ao3_content.py ao3_diff.py ao3_store.py ao3_web.py ao3_web.css ao3_web.js ao3_reader.js ao3_favicon.svg ao3_favicon.ico ao3_apple_touch_icon.png /app/
+COPY ao3_backup.py ao3_cli.py ao3_content.py ao3_db.py ao3_diff.py ao3_http.py ao3_legacy.py ao3_repos.py ao3_scheduler.py ao3_scraper.py ao3_store.py ao3_web.py ao3_web.css ao3_web.js ao3_reader.js ao3_favicon.svg ao3_favicon.ico ao3_apple_touch_icon.png /app/
 
 # 非 root 运行；/data 是数据挂载点
 RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin ao3 \

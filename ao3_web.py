@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ao3_content import Fragment, reading_html
 from ao3_diff import Difference, Export, chapter_heading, field_differences
+from ao3_http import verify_login_and_save_cookies
 from ao3_store import (
     ANCHOR_MODES, AO3_AUTH_MODES, BACKUP_ACTIONS, BACKUP_LOG, INTERVAL_UNITS,
     SCHEDULE_MODES, UNIT_SECONDS, WEEKDAY_LABELS, Archive, BackupSettings,
@@ -1988,8 +1989,6 @@ def serve(
         stop: threading.Event | None = None,
         status_cb: Callable[[str], None] | None = None,
     ) -> None:
-        from ao3_backup import verify_login_and_save_cookies
-
         verify_login_and_save_cookies(
             out_dir, user, password,
             timeout=timeout, prefer_v4=prefer_v4, retries=retries,
